@@ -1,8 +1,9 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// 🗿 РЕЖИМ И МОДЕЛЬ SKALA
+// 🗿 РЕЖИМ И МОДЕЛЬ SKALA (Yeta AI: deepseek-v4.1-flash-uncensored)
 // ══════════════════════════════════════════════════════════════════════════════
 
-export const MODEL_SKALA = "cognitivecomputations/dolphin-mistral-24b-venice-edition";
+export const MODEL_SKALA =
+  process.env.YETA_MODEL ?? process.env.SKALA_MODEL ?? "deepseek-v4.1-flash-uncensored";
 
 /**
  * 📝 СИСТЕМНЫЙ ПРОМПТ ДЛЯ РЕЖИМА SKALA

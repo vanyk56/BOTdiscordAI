@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: discord-ai-chat-swaga
+    runtime: node
+    plan: free
+    buildCommand: pnpm install --no-frozen-lockfile && pnpm run build
+    startCommand: node --import tsx/esm artifacts/discord-bot/src/index.ts
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RIVER_BASE_URL
+        value: https://api.river.ai/v1
+      - key: RIVER_MODEL
+        value: zai-org/GLM-5.3-Flash
+      - key: YETA_BASE_URL
+        value: https://platform.yeta.ai/v1
+      - key: YETA_MODEL
+        value: deepseek-v4.1-flash-uncensored
+      - key: RIVER_API_KEY
+        sync: false
+      - key: YETA_API_KEY
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false

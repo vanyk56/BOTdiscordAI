@@ -5,3 +5,6 @@ cmds = ["pnpm install --no-frozen-lockfile"]
 
 [phases.build]
 cmds = ["pnpm run build"]
+
+[start]
+cmd = "node --import tsx/esm artifacts/discord-bot/src/index.ts"

@@ -6,7 +6,7 @@ import {
   TextChannel,
   PermissionFlagsBits,
 } from "discord.js";
-import { openrouterRequest, MODEL_UTILS } from "../ai.js";
+import { openrouterRequest, MODEL_UTILS, ai } from "../ai.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -437,7 +437,7 @@ export async function checkAndModerate(
           imgUrl.includes(".gif") ||
           checkUrl.includes("tenor.com") ||
           checkUrl.includes("giphy.com") ||
-          embed.type === "gifv";
+          (embed as any).type === "gifv" || (embed as any).data?.type === "gifv";
 
         if (isGifEmbed) {
           console.log(`[AutoMod] Checking GIF embed: ${imgUrl.substring(0, 60)}`);

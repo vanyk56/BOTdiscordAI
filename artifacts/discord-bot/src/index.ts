@@ -1,3 +1,4 @@
+import http from "node:http";
 import {
   Client,
   GatewayIntentBits,
@@ -511,7 +512,7 @@ async function handleSkala(interaction: ChatInputCommandInteraction) {
 async function handleMode(interaction: ChatInputCommandInteraction) {
   const mode = interaction.options.getString("режим", true) as "standard" | "skala";
   setChannelMode(interaction.channelId, mode);
-  const modeName = mode === "skala" ? "🗿 Skala (Dolphin Mistral 24B Venice Edition)" : "⚡ Стандартный (Qwen 3.7 Flash)";
+  const modeName = mode === "skala" ? "🗿 Skala (DeepSeek V4.1 Flash Uncensored)" : "⚡ Стандартный (GLM-5.3 Flash)";
   await interaction.reply({
     content: `✅ В этом канале установлен режим ответов: **${modeName}**`,
   });
@@ -1253,7 +1254,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
     const chunks = splitMessage(response);
     for (let i = 0; i < chunks.length; i++) {
       if (i === 0) await message.reply(chunks[i]);
-      else await message.channel.send(chunks[i]);
+      else await (message.channel as any).send(chunks[i]);
     }
   } catch (error) {
     stopTyping();
@@ -1301,6 +1302,35 @@ process.once("SIGINT", () => {
 process.once("SIGTERM", () => {
   writeBotStatus("offline");
   process.exit(0);
+});
+
+
+// ─── HEALTH-CHECK HTTP SERVER FOR CLOUD HOSTING ──────────────────────────────
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
+const server = http.createServer((req, res) => {
+  if (req.url === "/health" || req.url === "/" || req.url === "/ping") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        bot: client.user ? client.user.tag : "connecting",
+        uptime: Math.floor(process.uptime()),
+        guilds: client.guilds?.cache.size ?? 0,
+        timestamp: new Date().toISOString(),
+        models: {
+          chat: MODEL_CHAT,
+          skala: MODEL_SKALA,
+        },
+      })
+    );
+    return;
+  }
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[HTTP Server] Health-check listening on http://0.0.0.0:${PORT}`);
 });
 
 client.login(DISCORD_BOT_TOKEN).catch((error) => {

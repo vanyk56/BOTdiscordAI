@@ -27,7 +27,7 @@ export const commands = [
 
   new SlashCommandBuilder()
     .setName("skala")
-    .setDescription("🗿 Задать вопрос Skala (Dolphin Mistral 24B Venice Edition)")
+    .setDescription("🗿 Задать вопрос Skala (DeepSeek V4.1 Flash Uncensored)")
     .addStringOption((opt) =>
       opt.setName("вопрос").setDescription("Твой вопрос к Skala").setRequired(true)
     ),
@@ -41,8 +41,8 @@ export const commands = [
         .setDescription("Выбери режим ответов для канала")
         .setRequired(true)
         .addChoices(
-          { name: "⚡ Стандартный (Qwen 3.7 Flash)", value: "standard" },
-          { name: "🗿 Skala (Dolphin Mistral 24B Venice Edition)", value: "skala" },
+          { name: "⚡ Стандартный (GLM-5.3 Flash)", value: "standard" },
+          { name: "🗿 Skala (DeepSeek V4.1 Flash Uncensored)", value: "skala" },
         )
     ),
 

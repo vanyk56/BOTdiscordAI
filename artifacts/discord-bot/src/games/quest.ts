@@ -169,9 +169,9 @@ function buildQuestEmbed(
   const embed = new EmbedBuilder()
     .setColor(0xe67e22)
     .setTitle(`⚔️ ${step.title}`)
-    .setDescription(step.situation)
+    .setDescription((step as QuestStep).situation)
     .addFields(
-      { name: "🌫️ Атмосфера", value: `*${step.atmosphere}*` },
+      { name: "🌫️ Атмосфера", value: `*${(step as QuestStep).atmosphere}*` },
       { name: `👥 Отряд (${participants.size})`, value: partyList, inline: true }
     )
     .setFooter({
