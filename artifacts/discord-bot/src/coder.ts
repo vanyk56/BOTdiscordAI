@@ -62,21 +62,23 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
     await interaction.editReply("⏳ **[1/5] Архитектор проектирует код...** (River AI: GLM-5.3-Flash)");
 
     const systemPrompt = `Ты — Senior Software Engineer и DevOps. Создай полный, рабочий и качественный проект по ТЗ пользователя.
-Ответь СТРОГО валидным JSON:
+Ответь СТРОГО валидным JSON без лишних рассуждений:
 {
-  "projectName": "latinskoe_nazvanie_proekta_cherez_defis",
+  "projectName": "latinskoe_nazvanie_cherez_defis",
   "description": "Краткое описание проекта на русском (1-2 предложения)",
   "entrypoint": "main.py",
   "requirements": "библиотеки для pip install через пробел (или пустая строка)",
   "files": {
-    "main.py": "полный рабочий код файла...",
-    "requirements.txt": "библиотеки по строкам...",
-    "README.md": "# Заголовок\\n\\nОписание проекта и инструкция по запуску..."
+    "main.py": "рабочий код файла",
+    "requirements.txt": "библиотеки",
+    "README.md": "# Описание"
   }
 }`;
 
     const project = await geminiJSON<GeneratedProject>(
-      `${systemPrompt}\n\nТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`
+      `${systemPrompt}\n\nТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`,
+      undefined,
+      { maxTokens: 8192 }
     );
 
     if (!project || !project.files || Object.keys(project.files).length === 0) {

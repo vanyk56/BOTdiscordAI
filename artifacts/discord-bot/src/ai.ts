@@ -158,16 +158,54 @@ export async function geminiText(
 }
 
 /**
- * JSON response helper for utilities and games
+ * Extract and parse JSON safely, stripping <think>...</think> and markdown code blocks
  */
-export async function geminiJSON<T>(prompt: string, model: string = MODEL_UTILS): Promise<T> {
-  const raw = await geminiText(
-    prompt + "\n\nОтветь ТОЛЬКО валидным JSON без markdown блоков и лишнего текста.",
-    undefined,
-    model
+export function extractAndParseJSON<T>(raw: string): T {
+  if (!raw || !raw.trim()) {
+    throw new Error("Нейросеть вернула пустой ответ.");
+  }
+
+  // 1. Убираем блоки размышлений <think>...</think>
+  let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
+  // 2. Ищем блок кода ```json ... ``` или ``` ... ```
+  const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlock && codeBlock[1]) {
+    text = codeBlock[1].trim();
+  } else {
+    // 3. Если блоков нет, ищем границы первого { и последнего }
+    const firstBrace = text.indexOf("{");
+    const lastBrace = text.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      text = text.substring(firstBrace, lastBrace + 1).trim();
+    }
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch (err: any) {
+    console.error("[JSON Parse Error]. Raw response was:\n", raw.slice(0, 500));
+    throw new Error(`Ошибка парсинга JSON: ${err.message}`);
+  }
+}
+
+/**
+ * JSON response helper for utilities, games and coder
+ */
+export async function geminiJSON<T>(
+  prompt: string,
+  model: string = MODEL_UTILS,
+  options: { maxTokens?: number; systemInstruction?: string } = {}
+): Promise<T> {
+  const raw = await openrouterRequest(
+    [{ role: "user", content: prompt + "\n\nОтветь ТОЛЬКО валидным JSON без markdown и лишнего текста." }],
+    model,
+    {
+      maxTokens: options.maxTokens ?? 8192,
+      systemInstruction: options.systemInstruction,
+    }
   );
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
-  return JSON.parse(cleaned) as T;
+  return extractAndParseJSON<T>(raw);
 }
 
 /**
