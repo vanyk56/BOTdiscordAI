@@ -1,3 +1,4 @@
+import { handleCoder } from "./coder.js";
 import http from "node:http";
 import {
   Client,
@@ -942,7 +943,7 @@ client.on(Events.GuildDelete, () => writeBotStatus("online"));
 
 // ─── SLASH COMMANDS ───────────────────────────────────────────────────────────
 
-const EXEMPT_COMMANDS = new Set(["help", "activate", "gencode", "deactivate"]);
+const EXEMPT_COMMANDS = new Set(["help", "activate", "gencode", "deactivate", "coder"]);
 
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (interaction.type !== InteractionType.ApplicationCommand) return;
@@ -977,6 +978,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 
     if (commandName === "help") return handleHelp(interaction);
     if (commandName === "ask") return handleAsk(interaction);
+    if (commandName === "coder") return handleCoder(interaction);
     if (commandName === "skala") return handleSkala(interaction);
     if (commandName === "mode") return handleMode(interaction);
     if (commandName === "imagine") return handleImagine(interaction);

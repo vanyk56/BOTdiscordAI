@@ -22,6 +22,12 @@ export const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("coder")
+    .setDescription("🤖 AI Агент: создать проект, протестировать в Linux MicroVM и запушить на GitHub")
+    .addStringOption((opt) => opt.setName("задача").setDescription("ТЗ: что нужно разработать").setRequired(true))
+    .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя репозитория GitHub (латиницей)").setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName("clear")
     .setDescription("Очистить историю разговора в этом канале"),
 
