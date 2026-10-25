@@ -139,11 +139,22 @@ export async function openrouterRequest(
     throw new Error(`${provider} API error (${response.status}): ${errorText.slice(0, 300)}`);
   }
 
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
+  const data = (await response.json()) as any;
+  const choice = data.choices?.[0];
+  const msg = choice?.message;
+  let text = "";
 
-  return data.choices?.[0]?.message?.content ?? "";
+  if (typeof msg?.content === "string" && msg.content.trim()) {
+    text = msg.content;
+  } else if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.trim()) {
+    text = msg.reasoning_content;
+  } else if (typeof choice?.text === "string" && choice.text.trim()) {
+    text = choice.text;
+  } else if (Array.isArray(msg?.content)) {
+    text = msg.content.map((p: any) => p.text || "").join("");
+  }
+
+  return text;
 }
 
 /**
@@ -162,7 +173,7 @@ export async function geminiText(
  */
 export function extractAndParseJSON<T>(raw: string): T {
   if (!raw || !raw.trim()) {
-    throw new Error("Нейросеть вернула пустой ответ.");
+    throw new Error("Нейросеть вернула пустой ответ. Попробуйте повторить запрос.");
   }
 
   // 1. Убираем блоки размышлений <think>...</think>
@@ -197,11 +208,12 @@ export async function geminiJSON<T>(
   model: string = MODEL_UTILS,
   options: { maxTokens?: number; systemInstruction?: string } = {}
 ): Promise<T> {
+  const maxTokens = options.maxTokens ?? 4096;
   const raw = await openrouterRequest(
-    [{ role: "user", content: prompt + "\n\nОтветь ТОЛЬКО валидным JSON без markdown и лишнего текста." }],
+    [{ role: "user", content: prompt + "\n\nОтветь ТОЛЬКО валидным JSON без лишнего текста и без markdown." }],
     model,
     {
-      maxTokens: options.maxTokens ?? 8192,
+      maxTokens,
       systemInstruction: options.systemInstruction,
     }
   );

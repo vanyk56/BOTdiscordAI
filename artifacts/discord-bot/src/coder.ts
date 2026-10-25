@@ -76,9 +76,12 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
 }`;
 
     const project = await geminiJSON<GeneratedProject>(
-      `${systemPrompt}\n\nТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`,
+      `ТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`,
       undefined,
-      { maxTokens: 8192 }
+      {
+        systemInstruction: systemPrompt,
+        maxTokens: 4096,
+      }
     );
 
     if (!project || !project.files || Object.keys(project.files).length === 0) {
