@@ -132,8 +132,8 @@ export async function openrouterRequest(
   }
   finalMessages.push(...messages);
 
-  // Для Yeta AI потолок токенов 16384 (во избежание Cloudflare 524 timeout), для River AI 65536
-  const defaultMaxTokens = isSkala ? 16384 : parseInt(process.env.MAX_TOKENS ?? "65536", 10);
+  // Для Yeta AI потолок токенов 32768 (благодаря стримингу 524 исключён), для River AI 65536
+  const defaultMaxTokens = isSkala ? 32768 : parseInt(process.env.MAX_TOKENS ?? "65536", 10);
   const useStream = options.stream ?? true; // Стриминг по умолчанию предотвращает тайм-аут Cloudflare 524
 
   const payload: Record<string, unknown> = {
@@ -142,7 +142,7 @@ export async function openrouterRequest(
     stream: useStream,
   };
   if (options.maxTokens !== undefined) {
-    payload.max_tokens = isSkala ? Math.min(options.maxTokens, 16384) : options.maxTokens;
+    payload.max_tokens = isSkala ? Math.min(options.maxTokens, 32768) : options.maxTokens;
   } else if (!isNaN(defaultMaxTokens) && defaultMaxTokens > 0) {
     payload.max_tokens = defaultMaxTokens;
   }
