@@ -164,7 +164,7 @@ async function handleCoderInternal(
         targetModel,
         {
           systemInstruction: systemPrompt,
-          maxTokens: 100000,
+          maxTokens: isUncensored ? 16384 : 100000,
         }
       );
     } catch (llmErr: any) {

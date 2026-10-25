@@ -60,6 +60,45 @@ export function isSkalaTarget(model: string): boolean {
   );
 }
 
+async function readSSEStream(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let fullText = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === "data: [DONE]") continue;
+      if (trimmed.startsWith("data: ")) {
+        try {
+          const json = JSON.parse(trimmed.slice(6));
+          const delta = json.choices?.[0]?.delta;
+          const chunk = delta?.content || delta?.reasoning_content || "";
+          fullText += chunk;
+        } catch {}
+      }
+    }
+  }
+
+  if (buffer.trim().startsWith("data: ") && buffer.trim() !== "data: [DONE]") {
+    try {
+      const json = JSON.parse(buffer.trim().slice(6));
+      const delta = json.choices?.[0]?.delta;
+      const chunk = delta?.content || delta?.reasoning_content || "";
+      fullText += chunk;
+    } catch {}
+  }
+
+  return fullText;
+}
+
 /**
  * Send request to AI API (River AI for standard/utils, Yeta AI for skala)
  */
@@ -74,6 +113,7 @@ export async function openrouterRequest(
     baseUrl?: string;
     apiKey?: string;
     isSkala?: boolean;
+    stream?: boolean;
   } = {}
 ): Promise<string> {
   const isSkala = options.isSkala ?? isSkalaTarget(model);
@@ -92,13 +132,17 @@ export async function openrouterRequest(
   }
   finalMessages.push(...messages);
 
-  const defaultMaxTokens = parseInt(process.env.MAX_TOKENS ?? "100000", 10);
+  // Для Yeta AI потолок токенов 16384 (во избежание Cloudflare 524 timeout), для River AI 65536
+  const defaultMaxTokens = isSkala ? 16384 : parseInt(process.env.MAX_TOKENS ?? "65536", 10);
+  const useStream = options.stream ?? true; // Стриминг по умолчанию предотвращает тайм-аут Cloudflare 524
+
   const payload: Record<string, unknown> = {
     model,
     messages: finalMessages,
+    stream: useStream,
   };
   if (options.maxTokens !== undefined) {
-    payload.max_tokens = options.maxTokens;
+    payload.max_tokens = isSkala ? Math.min(options.maxTokens, 16384) : options.maxTokens;
   } else if (!isNaN(defaultMaxTokens) && defaultMaxTokens > 0) {
     payload.max_tokens = defaultMaxTokens;
   }
@@ -113,7 +157,6 @@ export async function openrouterRequest(
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const controller = new AbortController();
-      // 5 минут на генерацию полного проекта
       const timeout = setTimeout(() => controller.abort(), 300_000);
 
       response = await fetch(`${targetBaseUrl}/chat/completions`, {
@@ -147,8 +190,28 @@ export async function openrouterRequest(
 
   if (!response.ok) {
     const errBody = await response.text();
+
+    // Авто-повтор при Cloudflare 524 Timeout
+    if (response.status === 524) {
+      console.warn(`[AI] Cloudflare 524 timeout on ${targetBaseUrl}. Retrying with streaming and lower tokens...`);
+      payload.stream = true;
+      payload.max_tokens = 8192;
+      try {
+        response = await fetch(`${targetBaseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${targetApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://discord.com",
+            "X-Title": "SWAGAgpt Discord Bot",
+          },
+          body: JSON.stringify(payload),
+        });
+      } catch {}
+    }
+
     const isTokensError =
-      (response.status === 400 || response.status === 422) &&
+      (response && (response.status === 400 || response.status === 422)) &&
       (errBody.toLowerCase().includes("max_tokens") ||
         errBody.toLowerCase().includes("maximum") ||
         errBody.toLowerCase().includes("token") ||
@@ -199,23 +262,33 @@ export async function openrouterRequest(
       const errorText = response ? await response.text().catch(() => errBody) : errBody;
       const status = response ? response.status : 500;
       const provider = isSkala ? "Yeta AI" : "River AI";
-      throw new Error(`${provider} API error (${status}): ${errorText.slice(0, 300)}`);
+      if (status === 524) {
+        throw new Error(`${provider} таймаут (Cloudflare 524: сервер Yeta AI не ответил вовремя). Попробуйте повторить запрос.`);
+      }
+      const cleanError = errorText.startsWith("<!DOCTYPE") ? "Сервер вернул HTML страницу ошибки (возможно, перегружен)" : errorText;
+      throw new Error(`${provider} API error (${status}): ${cleanError.slice(0, 300)}`);
     }
   }
 
-  const data = (await response.json()) as any;
-  const choice = data.choices?.[0];
-  const msg = choice?.message;
+  const contentType = response.headers.get("content-type") || "";
   let text = "";
 
-  if (typeof msg?.content === "string" && msg.content.trim()) {
-    text = msg.content;
-  } else if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.trim()) {
-    text = msg.reasoning_content;
-  } else if (typeof choice?.text === "string" && choice.text.trim()) {
-    text = choice.text;
-  } else if (Array.isArray(msg?.content)) {
-    text = msg.content.map((p: any) => p.text || "").join("");
+  if (contentType.includes("text/event-stream") || payload.stream === true) {
+    text = await readSSEStream(response);
+  } else {
+    const data = (await response.json()) as any;
+    const choice = data.choices?.[0];
+    const msg = choice?.message;
+
+    if (typeof msg?.content === "string" && msg.content.trim()) {
+      text = msg.content;
+    } else if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.trim()) {
+      text = msg.reasoning_content;
+    } else if (typeof choice?.text === "string" && choice.text.trim()) {
+      text = choice.text;
+    } else if (Array.isArray(msg?.content)) {
+      text = msg.content.map((p: any) => p.text || "").join("");
+    }
   }
 
   return text;
