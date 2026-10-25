@@ -1,4 +1,5 @@
 // ─── AI API INTEGRATION (RIVER AI & YETA AI) ───────────────────────────────────
+import { jsonrepair } from "jsonrepair";
 
 export const RIVER_BASE_URL = process.env.RIVER_BASE_URL ?? "https://api.river.ai/v1";
 export const RIVER_API_KEY =
@@ -112,7 +113,8 @@ export async function openrouterRequest(
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 90_000);
+      // 5 минут на генерацию полного проекта
+      const timeout = setTimeout(() => controller.abort(), 300_000);
 
       response = await fetch(`${targetBaseUrl}/chat/completions`, {
         method: "POST",
@@ -131,17 +133,8 @@ export async function openrouterRequest(
       lastFetchError = err;
       console.warn(`[AI] Attempt ${attempt}/3 fetch failed (${targetBaseUrl}):`, err?.message || err);
 
-      // If payload.max_tokens was high, lowering or omitting it often fixes socket hang-up
-      if (typeof payload.max_tokens === "number" && payload.max_tokens > 8192) {
-        payload.max_tokens = 8192;
-        console.warn(`[AI] Lowered max_tokens to 8192 on attempt ${attempt}`);
-      } else if (attempt === 2) {
-        delete payload.max_tokens;
-        console.warn(`[AI] Omitted max_tokens on attempt ${attempt}`);
-      }
-
       if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 1500));
+        await new Promise((r) => setTimeout(r, 2000));
       }
     }
   }
@@ -239,29 +232,8 @@ export async function geminiText(
   return openrouterRequest([{ role: "user", content: prompt }], model, { systemInstruction });
 }
 
-function cleanJSONString(str: string): string {
-  return str.replace(/,\s*([\}\]])/g, "$1");
-}
-
-function lenientParse<T>(input: string): T {
-  try {
-    return JSON.parse(input) as T;
-  } catch {}
-  try {
-    return JSON.parse(cleanJSONString(input)) as T;
-  } catch {}
-  try {
-    const sanitized = input.replace(/"((?:[^"\\]|\\.)*)"/g, (m) =>
-      m.replace(/\r?\n/g, "\\n").replace(/\t/g, "\\t")
-    );
-    return JSON.parse(cleanJSONString(sanitized)) as T;
-  } catch (err: any) {
-    throw err;
-  }
-}
-
 /**
- * Extract and parse JSON safely, handling ```json, outer braces, and stripping <think>...</think>
+ * Extract and parse JSON safely, handling ```json, outer braces, stripping <think>...</think>, and repairing truncated JSON
  */
 export function extractAndParseJSON<T>(raw: string): T {
   if (!raw || !raw.trim()) {
@@ -271,40 +243,53 @@ export function extractAndParseJSON<T>(raw: string): T {
   // 1. Убираем блоки размышлений <think>...</think>
   let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-  // 2. Сначала пробуем найти блок именно ```json ... ```
-  const jsonBlock = text.match(/```json\s*([\s\S]*?)\s*```/i);
-  if (jsonBlock && jsonBlock[1]) {
-    const candidate = jsonBlock[1].trim();
-    try {
-      return lenientParse<T>(candidate);
-    } catch {}
+  // 2. Снимаем обёртку ```json ... ``` или ``` ... ``` (даже если закрывающий ``` отсутствует)
+  let content = text;
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/i);
+  if (fenceMatch && fenceMatch[1] && fenceMatch[1].trim()) {
+    content = fenceMatch[1].trim();
   }
 
-  // 3. Ищем границы первого '{' и последнего '}'
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const candidate = text.substring(firstBrace, lastBrace + 1).trim();
-    try {
-      return lenientParse<T>(candidate);
-    } catch {}
+  // 3. Если есть открывающая фигурная скобка '{', начинаем с неё
+  const firstBrace = content.indexOf("{");
+  if (firstBrace !== -1) {
+    content = content.substring(firstBrace).trim();
   }
 
-  // 4. Ищем границы первого '[' и последнего ']'
-  const firstBracket = text.indexOf("[");
-  const lastBracket = text.lastIndexOf("]");
-  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
-    const candidate = text.substring(firstBracket, lastBracket + 1).trim();
-    try {
-      return lenientParse<T>(candidate);
-    } catch {}
-  }
-
-  // 5. Финальная попытка - прямой парсинг
+  // 4. Попытка стандартного JSON.parse
   try {
-    return lenientParse<T>(text);
+    return JSON.parse(content) as T;
+  } catch {}
+
+  // 5. Попытка через jsonrepair (чинит незакрытые скобки, кавычки, висячие запятые)
+  try {
+    const repaired = jsonrepair(content);
+    return JSON.parse(repaired) as T;
+  } catch {}
+
+  // 6. Если в тексте есть закрывающая '}', пробуем срез между первой '{' и последней '}'
+  const lastBrace = content.lastIndexOf("}");
+  if (lastBrace !== -1 && lastBrace > 0) {
+    const sub = content.substring(0, lastBrace + 1);
+    try {
+      return JSON.parse(sub) as T;
+    } catch {}
+    try {
+      return JSON.parse(jsonrepair(sub)) as T;
+    } catch {}
+  }
+
+  // 7. Пробуем jsonrepair на исходном тексте без очистки
+  try {
+    const repaired = jsonrepair(text);
+    return JSON.parse(repaired) as T;
+  } catch {}
+
+  // 8. Финальная попытка
+  try {
+    return JSON.parse(content) as T;
   } catch (err: any) {
-    console.error("[JSON Parse Error]. Raw response was:\n", raw.slice(0, 500));
+    console.error("[JSON Parse Error]. Raw response was:\n", raw.slice(0, 1000));
     throw new Error(`Ошибка парсинга JSON: ${err.message}`);
   }
 }

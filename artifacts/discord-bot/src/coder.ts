@@ -97,8 +97,9 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
     // ─── ШАГ 1: Проектирование кода через River AI (GLM-5.3-Flash) ────────────
     await interaction.editReply("⏳ **[1/5] Архитектор проектирует код...** (River AI: GLM-5.3-Flash)");
 
-    const systemPrompt = `Ты — Senior Software Engineer и DevOps. Создай полный, рабочий и качественный проект по ТЗ пользователя.
-Ответь СТРОГО валидным JSON-объектом в блоке \`\`\`json ... \`\`\`. Не пиши никакого текста и bash-команд вне этого JSON-блока:
+    const systemPrompt = `Ты — Senior Software Engineer и DevOps. Создай полный, рабочий и готовый к запуску проект по ТЗ пользователя.
+Ответь СТРОГО валидным JSON-объектом в блоке \`\`\`json ... \`\`\`.
+Пиши сразу JSON, без лишних размышлений, без приветствий и без текста вне JSON:
 {
   "projectName": "latinskoe_nazvanie_cherez_defis",
   "description": "Краткое описание проекта на русском (1-2 предложения)",
