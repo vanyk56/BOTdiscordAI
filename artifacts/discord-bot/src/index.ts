@@ -1,4 +1,4 @@
-import { handleCoder } from "./coder.js";
+import { handleCoder, handleCuoder } from "./coder.js";
 import http from "node:http";
 import {
   Client,
@@ -979,6 +979,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (commandName === "help") return handleHelp(interaction);
     if (commandName === "ask") return handleAsk(interaction);
     if (commandName === "coder") return handleCoder(interaction);
+    if (commandName === "cuoder") return handleCuoder(interaction);
     if (commandName === "skala") return handleSkala(interaction);
     if (commandName === "mode") return handleMode(interaction);
     if (commandName === "imagine") return handleImagine(interaction);

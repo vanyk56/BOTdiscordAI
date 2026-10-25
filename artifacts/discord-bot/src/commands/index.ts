@@ -28,6 +28,12 @@ export const commands = [
     .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя репозитория GitHub (латиницей)").setRequired(false)),
 
   new SlashCommandBuilder()
+    .setName("cuoder")
+    .setDescription("🔓 Uncensored AI Coder (Yeta DeepSeek Uncensored) • Доступно только создателю")
+    .addStringOption((opt) => opt.setName("задача").setDescription("ТЗ: что нужно разработать без цензуры").setRequired(true))
+    .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя репозитория GitHub (латиницей)").setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName("clear")
     .setDescription("Очистить историю разговора в этом канале"),
 
