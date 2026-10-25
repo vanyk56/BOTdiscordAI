@@ -8,11 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g pnpm@latest
+    && npm install -g pnpm@11.13.1
 
 COPY . .
 
-RUN pnpm install --no-frozen-lockfile
+RUN pnpm install --no-frozen-lockfile --ignore-scripts
 
 ENV NODE_ENV=production
 ENV PORT=8080
