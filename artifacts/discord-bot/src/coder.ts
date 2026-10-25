@@ -8,6 +8,7 @@ import {
 } from "discord.js";
 import { geminiJSON } from "./ai.js";
 import { Sandbox } from "novita-sandbox";
+import AdmZip from "adm-zip";
 
 interface GeneratedProject {
   projectName: string;
@@ -31,7 +32,7 @@ async function createGitHubRepo(token: string, repoName: string, description: st
         name: repoName,
         description: description.slice(0, 300),
         private: false,
-        auto_init: false,
+        auto_init: true,
       }),
     });
     return res.ok || res.status === 422; // 422 means repo already exists
@@ -41,19 +42,54 @@ async function createGitHubRepo(token: string, repoName: string, description: st
   }
 }
 
+async function uploadFilesToGitHub(
+  token: string,
+  owner: string,
+  repo: string,
+  files: Record<string, string>
+): Promise<boolean> {
+  try {
+    for (const [filePath, content] of Object.entries(files)) {
+      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
+      let sha: string | undefined;
+      try {
+        const getRes = await fetch(url, {
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "User-Agent": "SWAGAgpt-Discord-Bot",
+          },
+        });
+        if (getRes.ok) {
+          const info = (await getRes.json()) as any;
+          sha = info.sha;
+        }
+      } catch {}
+
+      await fetch(url, {
+        method: "PUT",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Accept": "application/vnd.github.v3+json",
+          "User-Agent": "SWAGAgpt-Discord-Bot",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: `Add ${filePath} via AI Agent`,
+          content: Buffer.from(content).toString("base64"),
+          ...(sha ? { sha } : {}),
+        }),
+      });
+    }
+    return true;
+  } catch (err) {
+    console.error("[GitHub API] uploadFiles error:", err);
+    return false;
+  }
+}
+
 export async function handleCoder(interaction: ChatInputCommandInteraction): Promise<void> {
   const task = interaction.options.getString("задача", true);
   const customRepo = interaction.options.getString("репозиторий", false);
-
-  const novitaKey = process.env.NOVITA_API_KEY;
-  if (!novitaKey) {
-    await interaction.reply({
-      content:
-        "❌ **NOVITA_API_KEY не задан!** Добавьте переменную окружения `NOVITA_API_KEY` в панели Render во вкладке Environment.",
-      ephemeral: true,
-    });
-    return;
-  }
 
   await interaction.deferReply();
 
@@ -75,71 +111,96 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
   }
 }`;
 
-    const project = await geminiJSON<GeneratedProject>(
-      `ТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`,
-      undefined,
-      {
-        systemInstruction: systemPrompt,
-        maxTokens: 100000,
-      }
-    );
-
-    if (!project || !project.files || Object.keys(project.files).length === 0) {
-      throw new Error("Нейросеть вернула пустую структуру файлов. Попробуйте уточнить запрос.");
+    let project: GeneratedProject;
+    try {
+      project = await geminiJSON<GeneratedProject>(
+        `ТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`,
+        undefined,
+        {
+          systemInstruction: systemPrompt,
+          maxTokens: 100000,
+        }
+      );
+    } catch (llmErr: any) {
+      console.error("[River AI Code Generation Error]:", llmErr);
+      const causeMsg = llmErr?.cause?.message ? ` (${llmErr.cause.message})` : "";
+      await interaction.editReply(`❌ **Ошибка на этапе проектирования (River AI):** ${llmErr?.message || "ошибка запроса"}${causeMsg}`);
+      return;
     }
 
-    // ─── ШАГ 2: Запуск Ubuntu MicroVM в Novita Sandbox ─────────────────────────
-    await interaction.editReply("⚡ **[2/5] Поднимаю виртуальную машину Ubuntu...** (Novita Agent Sandbox)");
+    if (!project || !project.files || Object.keys(project.files).length === 0) {
+      await interaction.editReply("❌ **Нейросеть вернула пустую структуру файлов.** Попробуйте уточнить запрос.");
+      return;
+    }
 
-    const sbx = await Sandbox.create({
-      apiKey: novitaKey,
-      timeoutMs: 300_000, // 5 минут тайм-аут
-    });
-
-    const workdir = "/home/user/app";
-    let autoFixed = false;
-    let testOutput = "";
-    let repoUrl: string | null = null;
     const repoName = (customRepo || project.projectName || "ai-agent-project")
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, "-");
 
-    try {
-      // ─── ШАГ 3: Запись файлов и установка библиотек ─────────────────────────
-      await interaction.editReply("📁 **[3/5] Записываю файлы и устанавливаю зависимости...**");
+    // ─── ШАГ 2: Запуск Ubuntu MicroVM в Novita Sandbox (если доступен) ────────
+    await interaction.editReply("⚡ **[2/5] Подключаю виртуальную машину Ubuntu...** (Novita Agent Sandbox)");
 
-      await sbx.commands.run(`mkdir -p ${workdir}`);
+    const novitaKey = (process.env.NOVITA_API_KEY || "").trim();
+    let sbx: Sandbox | null = null;
+    let sandboxStatusText = "";
+    let autoFixed = false;
+    let testOutput = "";
 
-      for (const [filePath, content] of Object.entries(project.files)) {
-        await sbx.files.write(`${workdir}/${filePath}`, content);
-      }
-
-      if (project.requirements && project.requirements.trim()) {
-        await sbx.commands.run(`pip install ${project.requirements}`, {
-          cwd: workdir,
-          timeoutMs: 60_000,
+    if (novitaKey) {
+      try {
+        sbx = await Sandbox.create({
+          apiKey: novitaKey,
+          timeoutMs: 180_000,
+          requestTimeoutMs: 30_000,
         });
-      } else if (project.files["requirements.txt"]) {
-        await sbx.commands.run("pip install -r requirements.txt", {
-          cwd: workdir,
-          timeoutMs: 60_000,
-        });
+      } catch (sbxErr: any) {
+        console.warn("[Novita Sandbox Init Warning]:", sbxErr?.message || sbxErr);
+        const cause = sbxErr?.cause?.message ? ` (${sbxErr.cause.message})` : "";
+        sandboxStatusText = `⚠️ Виртуальная машина Novita временно недоступна (${sbxErr?.message || "сеть"}${cause}). Проект сгенерирован и упакован автономно.`;
       }
+    } else {
+      sandboxStatusText = "ℹ️ Переменная NOVITA_API_KEY не задана на Railway. Проект сгенерирован и упакован автономно.";
+    }
 
-      // ─── ШАГ 4: Тестирование запуска кода ──────────────────────────────────
-      await interaction.editReply("🧪 **[4/5] Тестирую запуск программы в Linux...**");
+    const workdir = "/home/user/app";
 
-      const entry = project.entrypoint || "main.py";
-      let runRes = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
-        cwd: workdir,
-        timeoutMs: 20_000,
-      });
+    if (sbx) {
+      try {
+        // ─── ШАГ 3: Запись файлов и установка библиотек в MicroVM ──────────────
+        await interaction.editReply("📁 **[3/5] Записываю файлы и устанавливаю зависимости...**");
 
-      // Если упало с ошибкой (exit code не 0 и не 124 от timeout)
-      if (runRes.exitCode !== 0 && runRes.exitCode !== 124 && runRes.stderr) {
-        await interaction.editReply("🛠️ **[4/5] Найдена ошибка в коде! River AI исправляет баг...**");
+        await sbx.commands.run(`mkdir -p ${workdir}`);
 
-        const fixPrompt = `Ты Senior Python Developer. Скрипт упал с ошибкой в Linux.
+        for (const [filePath, content] of Object.entries(project.files)) {
+          await sbx.files.write(`${workdir}/${filePath}`, content);
+        }
+
+        if (project.requirements && project.requirements.trim()) {
+          await sbx.commands.run(`pip install ${project.requirements}`, {
+            cwd: workdir,
+            timeoutMs: 60_000,
+          });
+        } else if (project.files["requirements.txt"]) {
+          await sbx.commands.run("pip install -r requirements.txt", {
+            cwd: workdir,
+            timeoutMs: 60_000,
+          });
+        }
+
+        // ─── ШАГ 4: Тестирование запуска кода ──────────────────────────────────
+        await interaction.editReply("🧪 **[4/5] Тестирую запуск программы в Linux...**");
+
+        const entry = project.entrypoint || "main.py";
+        let runRes = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
+          cwd: workdir,
+          timeoutMs: 20_000,
+        });
+
+        // Если упало с ошибкой (exit code не 0 и не 124 от timeout)
+        if (runRes.exitCode !== 0 && runRes.exitCode !== 124 && runRes.stderr) {
+          await interaction.editReply("🛠️ **[4/5] Найдена ошибка в коде! River AI исправляет баг...**");
+
+          const fixPrompt = `Ты Senior Python Developer. Скрипт упал с ошибкой в Linux.
 Файл: ${entry}
 Код файла:
 ${project.files[entry]}
@@ -152,104 +213,115 @@ ${runRes.stderr}
   "fixedCode": "полный исправленный код файла без markdown"
 }`;
 
-        try {
-          const fixResult = await geminiJSON<{ fixedCode: string }>(fixPrompt);
-          if (fixResult?.fixedCode) {
-            await sbx.files.write(`${workdir}/${entry}`, fixResult.fixedCode);
-            runRes = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
-              cwd: workdir,
-              timeoutMs: 20_000,
-            });
-            autoFixed = true;
+          try {
+            const fixResult = await geminiJSON<{ fixedCode: string }>(fixPrompt);
+            if (fixResult?.fixedCode) {
+              project.files[entry] = fixResult.fixedCode;
+              await sbx.files.write(`${workdir}/${entry}`, fixResult.fixedCode);
+              runRes = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
+                cwd: workdir,
+                timeoutMs: 20_000,
+              });
+              autoFixed = true;
+            }
+          } catch (fixErr) {
+            console.error("[Coder auto-fix error]:", fixErr);
           }
-        } catch (err) {
-          console.error("[Coder auto-fix error]:", err);
         }
+
+        testOutput = runRes.stdout || runRes.stderr || "Скрипт успешно запущен без ошибок.";
+        sandboxStatusText = `Статус: **${runRes.exitCode === 0 || runRes.exitCode === 124 ? "✅ Успешно" : "⚠️ Завершён с кодом " + runRes.exitCode}**${autoFixed ? " *(Баг автоматически исправлен ИИ!)*" : ""}\n\`\`\`bash\n${testOutput.slice(0, 400)}\n\`\`\``;
+      } catch (vmRunErr: any) {
+        console.error("[VM Execution Error]:", vmRunErr);
+        sandboxStatusText = `⚠️ Ошибка выполнения внутри ВМ: ${vmRunErr?.message || "сбой"}. Проект скомпонован автономно.`;
+      } finally {
+        await sbx.kill().catch(() => {});
       }
-
-      testOutput = runRes.stdout || runRes.stderr || "Скрипт успешно запущен без вывода ошибок.";
-
-      // ─── ШАГ 5: Пуш на GitHub и упаковка в ZIP ──────────────────────────────
-      await interaction.editReply("🚀 **[5/5] Создаю репозиторий на GitHub и упаковываю архив...**");
-
-      const ghUser = process.env.GITHUB_USER;
-      const ghToken = process.env.GITHUB_TOKEN;
-
-      if (ghUser && ghToken) {
-        await createGitHubRepo(ghToken, repoName, project.description);
-        const remoteUrl = `https://${ghUser}:${ghToken}@github.com/${ghUser}/${repoName}.git`;
-        const gitCmd = `git init && git config user.name "AI Agent" && git config user.email "agent@river.ai" && git branch -M main && git add . && git commit -m "Auto-generated by AI Agent" && git remote add origin ${remoteUrl} && git push -u origin main --force`;
-        await sbx.commands.run(gitCmd, { cwd: workdir, timeoutMs: 30_000 });
-        repoUrl = `https://github.com/${ghUser}/${repoName}`;
-      }
-
-      // Создаем ZIP-архив внутри ВМ
-      await sbx.commands.run("zip -r /home/user/project.zip . -x '*.git*'", {
-        cwd: workdir,
-        timeoutMs: 20_000,
-      });
-
-      const zipBytes = await sbx.files.read("/home/user/project.zip", { format: "bytes" });
-      const zipBuffer = Buffer.from(zipBytes);
-
-      // Формируем красивый Embed с результатами
-      const fileNames = Object.keys(project.files)
-        .map((f) => `• \`${f}\``)
-        .join("\n");
-
-      const embed = new EmbedBuilder()
-        .setColor(0x57f287)
-        .setTitle(`🚀 Проект «${repoName}» успешно разработан!`)
-        .setDescription(`**Задача:** ${task}\n\n**Описание:** ${project.description}`)
-        .addFields(
-          { name: "📁 Созданные файлы", value: fileNames.slice(0, 1000), inline: true },
-          {
-            name: "🧪 Тест в Ubuntu MicroVM",
-            value: `Статус: **${runRes.exitCode === 0 || runRes.exitCode === 124 ? "✅ Успешно" : "⚠️ Завершён с кодом " + runRes.exitCode}**${autoFixed ? " *(Баг автоматически исправлен ИИ!)*" : ""}\n\`\`\`bash\n${testOutput.slice(0, 400)}\n\`\`\``,
-          }
-        )
-        .setFooter({ text: "Разработано AI Agent • Модель: GLM-5.3-Flash • Sandbox: Novita Linux" })
-        .setTimestamp();
-
-      if (repoUrl) {
-        embed.addFields({
-          name: "🔗 GitHub Репозиторий",
-          value: `[${ghUser}/${repoName}](${repoUrl}) — код уже запушен!`,
-        });
-      } else {
-        embed.addFields({
-          name: "ℹ️ GitHub",
-          value:
-            "*Чтобы бот сам заливал проект на GitHub, добавьте `GITHUB_TOKEN` и `GITHUB_USER` в Environment на Render.*",
-        });
-      }
-
-      const rows: ActionRowBuilder<ButtonBuilder>[] = [];
-      if (repoUrl) {
-        rows.push(
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder()
-              .setLabel("Открыть на GitHub")
-              .setStyle(ButtonStyle.Link)
-              .setURL(repoUrl)
-              .setEmoji("🐙")
-          )
-        );
-      }
-
-      await interaction.editReply({
-        content: `✅ **Готово! Проект разработан и протестирован в виртуальной машине.**`,
-        embeds: [embed],
-        components: rows,
-        files: [new AttachmentBuilder(zipBuffer, { name: `${repoName}.zip` })],
-      });
-    } finally {
-      // Обязательно уничтожаем виртуальную машину, чтобы не тратить ваучер
-      await sbx.kill().catch(() => {});
     }
+
+    // ─── ШАГ 5: Пуш на GitHub и упаковка в ZIP ────────────────────────────────
+    await interaction.editReply("🚀 **[5/5] Создаю репозиторий на GitHub и упаковываю архив...**");
+
+    const ghUser = (process.env.GITHUB_USER || "").trim();
+    const ghToken = (process.env.GITHUB_TOKEN || "").trim();
+    let repoUrl: string | null = null;
+
+    if (ghUser && ghToken) {
+      try {
+        const created = await createGitHubRepo(ghToken, repoName, project.description);
+        if (created) {
+          const uploaded = await uploadFilesToGitHub(ghToken, ghUser, repoName, project.files);
+          if (uploaded) {
+            repoUrl = `https://github.com/${ghUser}/${repoName}`;
+          }
+        }
+      } catch (ghErr) {
+        console.error("[GitHub Sync Error]:", ghErr);
+      }
+    }
+
+    // Создаем ZIP-архив через AdmZip в памяти (100% надёжно, без внешних утилит)
+    const zip = new AdmZip();
+    for (const [filePath, fileContent] of Object.entries(project.files)) {
+      zip.addFile(filePath, Buffer.from(fileContent, "utf-8"));
+    }
+    const zipBuffer = zip.toBuffer();
+
+    // Формируем красивый Embed с результатами
+    const fileNames = Object.keys(project.files)
+      .map((f) => `• \`${f}\``)
+      .join("\n");
+
+    const embed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle(`🚀 Проект «${repoName}» успешно разработан!`)
+      .setDescription(`**Задача:** ${task}\n\n**Описание:** ${project.description}`)
+      .addFields(
+        { name: "📁 Созданные файлы", value: fileNames.slice(0, 1000), inline: true },
+        {
+          name: "🧪 Тест в Ubuntu MicroVM",
+          value: sandboxStatusText.slice(0, 1000),
+        }
+      )
+      .setFooter({ text: "Разработано AI Agent • Модель: GLM-5.3-Flash • Sandbox: Novita Linux" })
+      .setTimestamp();
+
+    if (repoUrl) {
+      embed.addFields({
+        name: "🔗 GitHub Репозиторий",
+        value: `[${ghUser}/${repoName}](${repoUrl}) — код уже запушен!`,
+      });
+    } else {
+      embed.addFields({
+        name: "ℹ️ GitHub",
+        value:
+          "*Чтобы бот сам заливал проект на GitHub, добавьте `GITHUB_TOKEN` и `GITHUB_USER` в Environment на Railway.*",
+      });
+    }
+
+    const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+    if (repoUrl) {
+      rows.push(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setLabel("Открыть на GitHub")
+            .setStyle(ButtonStyle.Link)
+            .setURL(repoUrl)
+            .setEmoji("🐙")
+        )
+      );
+    }
+
+    await interaction.editReply({
+      content: `✅ **Готово! Проект разработан и упакован в архив.**`,
+      embeds: [embed],
+      components: rows,
+      files: [new AttachmentBuilder(zipBuffer, { name: `${repoName}.zip` })],
+    });
   } catch (error: any) {
     console.error("[handleCoder error]:", error);
     const msg = error?.message ? String(error.message) : "Неизвестная ошибка";
-    await interaction.editReply(`❌ **Ошибка при работе агента:** ${msg.slice(0, 300)}`);
+    const causeMsg = error?.cause?.message ? ` (${error.cause.message})` : "";
+    await interaction.editReply(`❌ **Ошибка при работе агента:** ${msg.slice(0, 250)}${causeMsg}`);
   }
 }

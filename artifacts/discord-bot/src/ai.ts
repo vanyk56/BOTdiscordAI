@@ -95,38 +95,25 @@ export async function openrouterRequest(
   const payload: Record<string, unknown> = {
     model,
     messages: finalMessages,
-    max_tokens: options.maxTokens ?? defaultMaxTokens,
   };
+  if (options.maxTokens !== undefined) {
+    payload.max_tokens = options.maxTokens;
+  } else if (!isNaN(defaultMaxTokens) && defaultMaxTokens > 0) {
+    payload.max_tokens = defaultMaxTokens;
+  }
 
   if (options.temperature !== undefined) payload.temperature = options.temperature;
   if (options.responseFormat) payload.response_format = options.responseFormat;
 
-  let response = await fetch(`${targetBaseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${targetApiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://discord.com",
-      "X-Title": "SWAGAgpt Discord Bot",
-    },
-    body: JSON.stringify(payload),
-  });
+  let response: Response | null = null;
+  let lastFetchError: any = null;
 
-  if (!response.ok) {
-    const errBody = await response.text();
-    const isTokensError =
-      (response.status === 400 || response.status === 422) &&
-      (errBody.toLowerCase().includes("max_tokens") ||
-        errBody.toLowerCase().includes("maximum") ||
-        errBody.toLowerCase().includes("token") ||
-        errBody.toLowerCase().includes("context"));
+  // Retry up to 3 times for network resilience
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 90_000);
 
-    // Auto-retry if max_tokens was too large for server limits
-    if (isTokensError && typeof payload.max_tokens === "number" && payload.max_tokens > 4096) {
-      const numMatch = errBody.match(/(?:less than or equal to|maximum(?: of)?|limit is|at most|exceeds)\s*(\d+)/i);
-      const safeLimit = numMatch && numMatch[1] ? parseInt(numMatch[1], 10) : 16384;
-      console.warn(`[AI] max_tokens ${payload.max_tokens} rejected. Retrying with ${safeLimit}...`);
-      payload.max_tokens = safeLimit;
       response = await fetch(`${targetBaseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -136,14 +123,52 @@ export async function openrouterRequest(
           "X-Title": "SWAGAgpt Discord Bot",
         },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
-    }
+      clearTimeout(timeout);
+      break; // Received HTTP response
+    } catch (err: any) {
+      lastFetchError = err;
+      console.warn(`[AI] Attempt ${attempt}/3 fetch failed (${targetBaseUrl}):`, err?.message || err);
 
-    // Fallback check if requested model is unavailable
-    if (!response.ok && model !== FALLBACK_MODEL && !isSkala) {
-      if (response.status === 404 || errBody.includes("not found")) {
-        console.warn(`[AI] Model ${model} unavailable (${response.status}), falling back to ${FALLBACK_MODEL}`);
-        payload.model = FALLBACK_MODEL;
+      // If payload.max_tokens was high, lowering or omitting it often fixes socket hang-up
+      if (typeof payload.max_tokens === "number" && payload.max_tokens > 8192) {
+        payload.max_tokens = 8192;
+        console.warn(`[AI] Lowered max_tokens to 8192 on attempt ${attempt}`);
+      } else if (attempt === 2) {
+        delete payload.max_tokens;
+        console.warn(`[AI] Omitted max_tokens on attempt ${attempt}`);
+      }
+
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+  }
+
+  if (!response) {
+    const provider = isSkala ? "Yeta AI" : "River AI";
+    const causeMsg = lastFetchError?.cause?.message ? ` (${lastFetchError.cause.message})` : "";
+    throw new Error(`${provider} недоступен (${targetBaseUrl}): ${lastFetchError?.message || "fetch failed"}${causeMsg}`);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    const isTokensError =
+      (response.status === 400 || response.status === 422) &&
+      (errBody.toLowerCase().includes("max_tokens") ||
+        errBody.toLowerCase().includes("maximum") ||
+        errBody.toLowerCase().includes("token") ||
+        errBody.toLowerCase().includes("context") ||
+        errBody.toLowerCase().includes("range"));
+
+    // Auto-retry if max_tokens was too large for server limits
+    if (isTokensError && typeof payload.max_tokens === "number" && payload.max_tokens > 4096) {
+      const numMatch = errBody.match(/(?:<=|less than or equal to|maximum(?: of)?|limit is|at most|exceeds|between)\s*(\d+)/i);
+      const safeLimit = numMatch && numMatch[1] ? parseInt(numMatch[1], 10) : 8192;
+      console.warn(`[AI] max_tokens ${payload.max_tokens} rejected. Retrying with ${safeLimit}...`);
+      payload.max_tokens = safeLimit;
+      try {
         response = await fetch(`${targetBaseUrl}/chat/completions`, {
           method: "POST",
           headers: {
@@ -154,16 +179,34 @@ export async function openrouterRequest(
           },
           body: JSON.stringify(payload),
         });
-      } else {
-        const provider = isSkala ? "Yeta AI" : "River AI";
-        throw new Error(`${provider} API error (${response.status}): ${errBody.slice(0, 300)}`);
+      } catch {}
+    }
+
+    // Fallback check if requested model is unavailable
+    if (response && !response.ok && model !== FALLBACK_MODEL && !isSkala) {
+      if (response.status === 404 || errBody.includes("not found")) {
+        console.warn(`[AI] Model ${model} unavailable (${response.status}), falling back to ${FALLBACK_MODEL}`);
+        payload.model = FALLBACK_MODEL;
+        try {
+          response = await fetch(`${targetBaseUrl}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${targetApiKey}`,
+              "Content-Type": "application/json",
+              "HTTP-Referer": "https://discord.com",
+              "X-Title": "SWAGAgpt Discord Bot",
+            },
+            body: JSON.stringify(payload),
+          });
+        } catch {}
       }
     }
 
-    if (!response.ok) {
-      const errorText = await response.text();
+    if (!response || !response.ok) {
+      const errorText = response ? await response.text().catch(() => errBody) : errBody;
+      const status = response ? response.status : 500;
       const provider = isSkala ? "Yeta AI" : "River AI";
-      throw new Error(`${provider} API error (${response.status}): ${errorText.slice(0, 300)}`);
+      throw new Error(`${provider} API error (${status}): ${errorText.slice(0, 300)}`);
     }
   }
 
@@ -196,6 +239,27 @@ export async function geminiText(
   return openrouterRequest([{ role: "user", content: prompt }], model, { systemInstruction });
 }
 
+function cleanJSONString(str: string): string {
+  return str.replace(/,\s*([\}\]])/g, "$1");
+}
+
+function lenientParse<T>(input: string): T {
+  try {
+    return JSON.parse(input) as T;
+  } catch {}
+  try {
+    return JSON.parse(cleanJSONString(input)) as T;
+  } catch {}
+  try {
+    const sanitized = input.replace(/"((?:[^"\\]|\\.)*)"/g, (m) =>
+      m.replace(/\r?\n/g, "\\n").replace(/\t/g, "\\t")
+    );
+    return JSON.parse(cleanJSONString(sanitized)) as T;
+  } catch (err: any) {
+    throw err;
+  }
+}
+
 /**
  * Extract and parse JSON safely, handling ```json, outer braces, and stripping <think>...</think>
  */
@@ -212,12 +276,8 @@ export function extractAndParseJSON<T>(raw: string): T {
   if (jsonBlock && jsonBlock[1]) {
     const candidate = jsonBlock[1].trim();
     try {
-      return JSON.parse(candidate) as T;
-    } catch {
-      try {
-        return JSON.parse(candidate.replace(/,\s*([\}\]])/g, "$1")) as T;
-      } catch {}
-    }
+      return lenientParse<T>(candidate);
+    } catch {}
   }
 
   // 3. Ищем границы первого '{' и последнего '}'
@@ -226,12 +286,8 @@ export function extractAndParseJSON<T>(raw: string): T {
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     const candidate = text.substring(firstBrace, lastBrace + 1).trim();
     try {
-      return JSON.parse(candidate) as T;
-    } catch {
-      try {
-        return JSON.parse(candidate.replace(/,\s*([\}\]])/g, "$1")) as T;
-      } catch {}
-    }
+      return lenientParse<T>(candidate);
+    } catch {}
   }
 
   // 4. Ищем границы первого '[' и последнего ']'
@@ -240,17 +296,13 @@ export function extractAndParseJSON<T>(raw: string): T {
   if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
     const candidate = text.substring(firstBracket, lastBracket + 1).trim();
     try {
-      return JSON.parse(candidate) as T;
-    } catch {
-      try {
-        return JSON.parse(candidate.replace(/,\s*([\}\]])/g, "$1")) as T;
-      } catch {}
-    }
+      return lenientParse<T>(candidate);
+    } catch {}
   }
 
   // 5. Финальная попытка - прямой парсинг
   try {
-    return JSON.parse(text) as T;
+    return lenientParse<T>(text);
   } catch (err: any) {
     console.error("[JSON Parse Error]. Raw response was:\n", raw.slice(0, 500));
     throw new Error(`Ошибка парсинга JSON: ${err.message}`);
