@@ -502,8 +502,10 @@ async function handleSkala(interaction: ChatInputCommandInteraction) {
     const chunks = splitMessage(response || "Skala молчит...");
     await interaction.editReply(chunks[0]);
     for (let i = 1; i < chunks.length; i++) await interaction.channel?.send(chunks[i]);
-  } catch {
-    await interaction.editReply("🗿 Skala временно недоступен. Попробуй ещё раз!");
+  } catch (error: any) {
+    console.error("[handleSkala error]:", error);
+    const msg = error?.message ? String(error.message) : "Неизвестная ошибка";
+    await interaction.editReply(`🗿 Skala ошибка: ${msg.slice(0, 250)}`);
   }
 }
 
