@@ -197,7 +197,7 @@ export async function geminiText(
 }
 
 /**
- * Extract and parse JSON safely, stripping <think>...</think> and markdown code blocks
+ * Extract and parse JSON safely, handling ```json, outer braces, and stripping <think>...</think>
  */
 export function extractAndParseJSON<T>(raw: string): T {
   if (!raw || !raw.trim()) {
@@ -207,19 +207,48 @@ export function extractAndParseJSON<T>(raw: string): T {
   // 1. Убираем блоки размышлений <think>...</think>
   let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-  // 2. Ищем блок кода ```json ... ``` или ``` ... ```
-  const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (codeBlock && codeBlock[1]) {
-    text = codeBlock[1].trim();
-  } else {
-    // 3. Если блоков нет, ищем границы первого { и последнего }
-    const firstBrace = text.indexOf("{");
-    const lastBrace = text.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      text = text.substring(firstBrace, lastBrace + 1).trim();
+  // 2. Сначала пробуем найти блок именно ```json ... ```
+  const jsonBlock = text.match(/```json\s*([\s\S]*?)\s*```/i);
+  if (jsonBlock && jsonBlock[1]) {
+    const candidate = jsonBlock[1].trim();
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      try {
+        return JSON.parse(candidate.replace(/,\s*([\}\]])/g, "$1")) as T;
+      } catch {}
     }
   }
 
+  // 3. Ищем границы первого '{' и последнего '}'
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    const candidate = text.substring(firstBrace, lastBrace + 1).trim();
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      try {
+        return JSON.parse(candidate.replace(/,\s*([\}\]])/g, "$1")) as T;
+      } catch {}
+    }
+  }
+
+  // 4. Ищем границы первого '[' и последнего ']'
+  const firstBracket = text.indexOf("[");
+  const lastBracket = text.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    const candidate = text.substring(firstBracket, lastBracket + 1).trim();
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      try {
+        return JSON.parse(candidate.replace(/,\s*([\}\]])/g, "$1")) as T;
+      } catch {}
+    }
+  }
+
+  // 5. Финальная попытка - прямой парсинг
   try {
     return JSON.parse(text) as T;
   } catch (err: any) {

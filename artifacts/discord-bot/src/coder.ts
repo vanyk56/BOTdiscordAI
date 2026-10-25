@@ -62,7 +62,7 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
     await interaction.editReply("⏳ **[1/5] Архитектор проектирует код...** (River AI: GLM-5.3-Flash)");
 
     const systemPrompt = `Ты — Senior Software Engineer и DevOps. Создай полный, рабочий и качественный проект по ТЗ пользователя.
-Ответь СТРОГО валидным JSON без лишних рассуждений:
+Ответь СТРОГО валидным JSON-объектом в блоке \`\`\`json ... \`\`\`. Не пиши никакого текста и bash-команд вне этого JSON-блока:
 {
   "projectName": "latinskoe_nazvanie_cherez_defis",
   "description": "Краткое описание проекта на русском (1-2 предложения)",
