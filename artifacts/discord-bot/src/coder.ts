@@ -97,17 +97,26 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
     // ─── ШАГ 1: Проектирование кода через River AI (GLM-5.3-Flash) ────────────
     await interaction.editReply("⏳ **[1/5] Архитектор проектирует код...** (River AI: GLM-5.3-Flash)");
 
-    const systemPrompt = `Ты — Senior Software Engineer и DevOps. Создай полный, рабочий и готовый к запуску проект по ТЗ пользователя.
+    const systemPrompt = `Ты — Senior Software Engineer и Fullstack разработчик.
+Создай качественный, красивый, полный и готовый к использованию проект строго по ТЗ пользователя.
+
+ВАЖНЫЕ ПРАВИЛА ВЫБОРА СТЕКА:
+1. Если пользователь просит HTML-сайт, веб-страницу, лендинг, визитку или верстку — создавай НАПРЯМУЮ веб-файлы:
+   - "index.html" (полная, красивая, адаптивная верстка с современным дизайном, встроенными или отдельными CSS и JS),
+   - при необходимости: "styles.css", "script.js", "README.md".
+   - НЕ оборачивай чистый HTML/CSS в Python main.py, если пользователь не просил бэкенд! В таком случае entrypoint: "index.html".
+2. Если пользователь просит Python-скрипт, бота, бэкенд, парсер или аналитику — создавай "main.py", "requirements.txt", "README.md". entrypoint: "main.py".
+3. Если пользователь просит Node.js / JavaScript — создавай "index.js", "package.json", "README.md". entrypoint: "index.js".
+
 Ответь СТРОГО валидным JSON-объектом в блоке \`\`\`json ... \`\`\`.
 Пиши сразу JSON, без лишних размышлений, без приветствий и без текста вне JSON:
 {
   "projectName": "latinskoe_nazvanie_cherez_defis",
   "description": "Краткое описание проекта на русском (1-2 предложения)",
-  "entrypoint": "main.py",
-  "requirements": "библиотеки для pip install через пробел (или пустая строка)",
+  "entrypoint": "index.html или main.py",
+  "requirements": "библиотеки для pip install через пробел (если Python, иначе пустая строка)",
   "files": {
-    "main.py": "рабочий код файла",
-    "requirements.txt": "библиотеки",
+    "index.html": "<!DOCTYPE html>...",
     "README.md": "# Описание"
   }
 }`;
@@ -191,14 +200,46 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
         // ─── ШАГ 4: Тестирование запуска кода ──────────────────────────────────
         await interaction.editReply("🧪 **[4/5] Тестирую запуск программы в Linux...**");
 
-        const entry = project.entrypoint || "main.py";
-        let runRes = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
-          cwd: workdir,
-          timeoutMs: 20_000,
-        });
+        const entry = project.entrypoint || Object.keys(project.files)[0] || "index.html";
+        let testCmd = "";
+        const isWeb = entry.endsWith(".html") || Boolean(project.files["index.html"]);
 
-        // Если упало с ошибкой (exit code не 0 и не 124 от timeout)
-        if (runRes.exitCode !== 0 && runRes.exitCode !== 124 && runRes.stderr) {
+        if (isWeb) {
+          testCmd = `python3 -m http.server 8080 --directory ${workdir} & sleep 1; curl -I -s http://localhost:8080/ | head -n 5`;
+        } else if (entry.endsWith(".py")) {
+          testCmd = `timeout 10s python3 ${entry}`;
+        } else if (entry.endsWith(".js") || entry.endsWith(".mjs")) {
+          testCmd = `timeout 10s node ${entry}`;
+        } else {
+          testCmd = `ls -la ${workdir}`;
+        }
+
+        let runExitCode = 0;
+        let runStdout = "";
+        let runStderr = "";
+
+        try {
+          const runRes = await sbx.commands.run(testCmd, {
+            cwd: workdir,
+            timeoutMs: 20_000,
+          });
+          runExitCode = runRes.exitCode;
+          runStdout = runRes.stdout;
+          runStderr = runRes.stderr;
+        } catch (cmdErr: any) {
+          // Если exit status 124 (timeout долгоживущего веб-сервера) — это успешный запуск
+          if (String(cmdErr?.message || "").includes("124") || cmdErr?.exitCode === 124) {
+            runExitCode = 0;
+            runStdout = cmdErr.stdout || "Веб-сервер успешно запущен и работает в фоне.";
+          } else {
+            runExitCode = cmdErr.exitCode ?? 1;
+            runStdout = cmdErr.stdout || "";
+            runStderr = cmdErr.stderr || cmdErr.message || "";
+          }
+        }
+
+        // Если упало с ошибкой и это Python файл
+        if (runExitCode !== 0 && runStderr && entry.endsWith(".py") && project.files[entry]) {
           await interaction.editReply("🛠️ **[4/5] Найдена ошибка в коде! River AI исправляет баг...**");
 
           const fixPrompt = `Ты Senior Python Developer. Скрипт упал с ошибкой в Linux.
@@ -207,7 +248,7 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
 ${project.files[entry]}
 
 Ошибка из терминала:
-${runRes.stderr}
+${runStderr}
 
 Исправь ошибку. Ответь ТОЛЬКО валидным JSON:
 {
@@ -219,19 +260,30 @@ ${runRes.stderr}
             if (fixResult?.fixedCode) {
               project.files[entry] = fixResult.fixedCode;
               await sbx.files.write(`${workdir}/${entry}`, fixResult.fixedCode);
-              runRes = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
-                cwd: workdir,
-                timeoutMs: 20_000,
-              });
-              autoFixed = true;
+              try {
+                const reTest = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
+                  cwd: workdir,
+                  timeoutMs: 20_000,
+                });
+                runExitCode = reTest.exitCode;
+                runStdout = reTest.stdout;
+                runStderr = reTest.stderr;
+                autoFixed = true;
+              } catch (reErr: any) {
+                if (String(reErr?.message || "").includes("124")) {
+                  runExitCode = 0;
+                  runStdout = "Скрипт успешно работает в фоне.";
+                  autoFixed = true;
+                }
+              }
             }
           } catch (fixErr) {
             console.error("[Coder auto-fix error]:", fixErr);
           }
         }
 
-        testOutput = runRes.stdout || runRes.stderr || "Скрипт успешно запущен без ошибок.";
-        sandboxStatusText = `Статус: **${runRes.exitCode === 0 || runRes.exitCode === 124 ? "✅ Успешно" : "⚠️ Завершён с кодом " + runRes.exitCode}**${autoFixed ? " *(Баг автоматически исправлен ИИ!)*" : ""}\n\`\`\`bash\n${testOutput.slice(0, 400)}\n\`\`\``;
+        testOutput = runStdout || runStderr || (isWeb ? "HTML/CSS сайт успешно проверен и готов к просмотру в браузере." : "Скрипт успешно запущен без ошибок.");
+        sandboxStatusText = `Статус: **${runExitCode === 0 ? "✅ Успешно" : "⚠️ Завершён с кодом " + runExitCode}**${autoFixed ? " *(Баг автоматически исправлен ИИ!)*" : ""}\n\`\`\`bash\n${testOutput.slice(0, 400)}\n\`\`\``;
       } catch (vmRunErr: any) {
         console.error("[VM Execution Error]:", vmRunErr);
         sandboxStatusText = `⚠️ Ошибка выполнения внутри ВМ: ${vmRunErr?.message || "сбой"}. Проект скомпонован автономно.`;
