@@ -226,7 +226,7 @@ async function generateTextResponse(
     messages.push({ role: "user", content: userText });
   }
 
-  const mode = getChannelMode(channelId);
+  const mode = guildId === "1424464968438382767" ? "standard" : getChannelMode(channelId);
   const activeModel = mode === "skala" ? MODEL_SKALA : MODEL_CHAT;
   const activePrompt = mode === "skala" ? SKALA_SYSTEM_PROMPT : getSystemPrompt(guildId);
 
@@ -491,6 +491,12 @@ async function handleAsk(interaction: ChatInputCommandInteraction) {
 // ─── SLASH COMMAND: /skala ───────────────────────────────────────────────────
 
 async function handleSkala(interaction: ChatInputCommandInteraction) {
+  if (interaction.guildId === "1424464968438382767") {
+    await interaction.reply({
+      content: "не работает потому что так захотел режу тёлок by Vanyk56",
+    });
+    return;
+  }
   const question = interaction.options.getString("вопрос", true);
   await interaction.deferReply();
   try {
@@ -513,6 +519,12 @@ async function handleSkala(interaction: ChatInputCommandInteraction) {
 
 async function handleMode(interaction: ChatInputCommandInteraction) {
   const mode = interaction.options.getString("режим", true) as "standard" | "skala";
+  if (interaction.guildId === "1424464968438382767" && mode === "skala") {
+    await interaction.reply({
+      content: "не работает потому что так захотел режу тёлок by Vanyk56",
+    });
+    return;
+  }
   setChannelMode(interaction.channelId, mode);
   const modeName = mode === "skala" ? "🗿 Skala (DeepSeek V4.1 Flash Uncensored)" : "⚡ Стандартный (GLM-5.3 Flash)";
   await interaction.reply({
