@@ -1308,7 +1308,7 @@ process.once("SIGTERM", () => {
 // ─── HEALTH-CHECK HTTP SERVER FOR CLOUD HOSTING ──────────────────────────────
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const server = http.createServer((req, res) => {
-  if (req.url === "/health" || req.url === "/" || req.url === "/ping") {
+  if (req.url === "/health" || req.url === "/healthz" || req.url === "/" || req.url === "/ping") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
