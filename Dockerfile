@@ -10,12 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g pnpm@latest
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY artifacts/discord-bot/package.json ./artifacts/discord-bot/
+COPY . .
 
 RUN pnpm install --no-frozen-lockfile
-
-COPY . .
 
 ENV NODE_ENV=production
 ENV PORT=8080
