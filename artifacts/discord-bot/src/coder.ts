@@ -80,7 +80,7 @@ export async function handleCoder(interaction: ChatInputCommandInteraction): Pro
       undefined,
       {
         systemInstruction: systemPrompt,
-        maxTokens: 4096,
+        maxTokens: 100000,
       }
     );
 

@@ -91,10 +91,11 @@ export async function openrouterRequest(
   }
   finalMessages.push(...messages);
 
+  const defaultMaxTokens = parseInt(process.env.MAX_TOKENS ?? "100000", 10);
   const payload: Record<string, unknown> = {
     model,
     messages: finalMessages,
-    max_tokens: options.maxTokens ?? 4096,
+    max_tokens: options.maxTokens ?? defaultMaxTokens,
   };
 
   if (options.temperature !== undefined) payload.temperature = options.temperature;
@@ -111,12 +112,21 @@ export async function openrouterRequest(
     body: JSON.stringify(payload),
   });
 
-  // Fallback check if requested model is unavailable
-  if (!response.ok && model !== FALLBACK_MODEL && !isSkala) {
+  if (!response.ok) {
     const errBody = await response.text();
-    if (response.status === 404 || errBody.includes("not found")) {
-      console.warn(`[AI] Model ${model} unavailable (${response.status}), falling back to ${FALLBACK_MODEL}`);
-      payload.model = FALLBACK_MODEL;
+    const isTokensError =
+      (response.status === 400 || response.status === 422) &&
+      (errBody.toLowerCase().includes("max_tokens") ||
+        errBody.toLowerCase().includes("maximum") ||
+        errBody.toLowerCase().includes("token") ||
+        errBody.toLowerCase().includes("context"));
+
+    // Auto-retry if max_tokens was too large for server limits
+    if (isTokensError && typeof payload.max_tokens === "number" && payload.max_tokens > 4096) {
+      const numMatch = errBody.match(/(?:less than or equal to|maximum(?: of)?|limit is|at most|exceeds)\s*(\d+)/i);
+      const safeLimit = numMatch && numMatch[1] ? parseInt(numMatch[1], 10) : 16384;
+      console.warn(`[AI] max_tokens ${payload.max_tokens} rejected. Retrying with ${safeLimit}...`);
+      payload.max_tokens = safeLimit;
       response = await fetch(`${targetBaseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -127,16 +137,34 @@ export async function openrouterRequest(
         },
         body: JSON.stringify(payload),
       });
-    } else {
-      const provider = isSkala ? "Yeta AI" : "River AI";
-      throw new Error(`${provider} API error (${response.status}): ${errBody.slice(0, 300)}`);
     }
-  }
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    const provider = isSkala ? "Yeta AI" : "River AI";
-    throw new Error(`${provider} API error (${response.status}): ${errorText.slice(0, 300)}`);
+    // Fallback check if requested model is unavailable
+    if (!response.ok && model !== FALLBACK_MODEL && !isSkala) {
+      if (response.status === 404 || errBody.includes("not found")) {
+        console.warn(`[AI] Model ${model} unavailable (${response.status}), falling back to ${FALLBACK_MODEL}`);
+        payload.model = FALLBACK_MODEL;
+        response = await fetch(`${targetBaseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${targetApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://discord.com",
+            "X-Title": "SWAGAgpt Discord Bot",
+          },
+          body: JSON.stringify(payload),
+        });
+      } else {
+        const provider = isSkala ? "Yeta AI" : "River AI";
+        throw new Error(`${provider} API error (${response.status}): ${errBody.slice(0, 300)}`);
+      }
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const provider = isSkala ? "Yeta AI" : "River AI";
+      throw new Error(`${provider} API error (${response.status}): ${errorText.slice(0, 300)}`);
+    }
   }
 
   const data = (await response.json()) as any;
@@ -208,7 +236,7 @@ export async function geminiJSON<T>(
   model: string = MODEL_UTILS,
   options: { maxTokens?: number; systemInstruction?: string } = {}
 ): Promise<T> {
-  const maxTokens = options.maxTokens ?? 4096;
+  const maxTokens = options.maxTokens ?? parseInt(process.env.MAX_TOKENS ?? "100000", 10);
   const raw = await openrouterRequest(
     [{ role: "user", content: prompt + "\n\nОтветь ТОЛЬКО валидным JSON без лишнего текста и без markdown." }],
     model,
