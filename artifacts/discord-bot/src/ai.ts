@@ -558,9 +558,40 @@ export async function geminiGenerateImage(
       }
     }
 
+    // ─── 3. Резервный генератор FLUX (Pollinations AI — 100% бесплатно, быстрый GPU-инференс) ───
+    try {
+      const encodedPrompt = encodeURIComponent(prompt.slice(0, 1000));
+      const fluxUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=1024&height=1024&nologo=true`;
+      const fluxRes = await fetch(fluxUrl, { signal: AbortSignal.timeout(30_000) });
+      if (fluxRes.ok) {
+        const arrayBuf = await fluxRes.arrayBuffer();
+        const contentType = fluxRes.headers.get("content-type") ?? "image/jpeg";
+        return {
+          buffer: Buffer.from(arrayBuf),
+          mimeType: contentType.split(";")[0]!,
+        };
+      }
+    } catch (pollErr) {
+      console.warn("[Image] Pollinations Flux fallback failed:", pollErr);
+    }
+
     return null;
   } catch (error) {
     console.error("[Image] Image generation error:", error);
+    // Попытка Flux при любой ошибке первичного API
+    try {
+      const encodedPrompt = encodeURIComponent(prompt.slice(0, 1000));
+      const fluxUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=1024&height=1024&nologo=true`;
+      const fluxRes = await fetch(fluxUrl, { signal: AbortSignal.timeout(30_000) });
+      if (fluxRes.ok) {
+        const arrayBuf = await fluxRes.arrayBuffer();
+        const contentType = fluxRes.headers.get("content-type") ?? "image/jpeg";
+        return {
+          buffer: Buffer.from(arrayBuf),
+          mimeType: contentType.split(";")[0]!,
+        };
+      }
+    } catch {}
     return null;
   }
 }

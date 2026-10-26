@@ -121,8 +121,9 @@ const SYSTEM_PROMPT = `Ты — умный и дружелюбный ИИ-асс
 ВАЖНО: Никогда не используй LaTeX-форматирование ($$...$$, $...$, \frac, \alpha и т.д.). Discord не поддерживает LaTeX. Пиши формулы и математику обычным текстом: например "α = 180° × (n-2) / n" вместо LaTeX.`;
 
 const IMAGE_GEN_KEYWORDS = [
-  "нарисуй", "нарисовать", "создай изображение", "создай картинку", "создай фото",
-  "сгенерируй", "сгенерировать", "генерируй", "сделай изображение", "сделай картинку",
+  "нарисуй", "нарисовать", "создай изображение", "создай картинку", "создай фото", "создай арт",
+  "сгенерируй изображение", "сгенерируй картинку", "сгенерируй фото", "сгенерируй арт",
+  "сделай изображение", "сделай картинку", "сделай фото", "сделай арт",
   "draw", "generate image", "create image", "make image", "paint", "imagine",
 ];
 
@@ -136,6 +137,20 @@ const IMAGE_EDIT_KEYWORDS = [
 
 function isImageGenerationRequest(text: string) {
   const lower = text.toLowerCase();
+  // Если пользователь явно попросил текст, список или указал, что это НЕ картинка
+  if (
+    lower.includes("не изображение") ||
+    lower.includes("не картинку") ||
+    lower.includes("не фото") ||
+    lower.includes("не рисуй") ||
+    lower.includes("текстом") ||
+    lower.includes("в столбик") ||
+    lower.includes("список") ||
+    lower.includes("фамили") ||
+    lower.includes("код")
+  ) {
+    return false;
+  }
   return IMAGE_GEN_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
