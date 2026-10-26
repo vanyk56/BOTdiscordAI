@@ -23,6 +23,7 @@ import {
 } from "discord.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { parseGitHubRepo, fetchGitHubRepoContext } from "./utils/github.js";
 import { ai, geminiText, geminiGenerateImage, geminiEditImage, openrouterChat, MODEL_CHAT, MODEL_SKALA, type OpenRouterMessage } from "./ai.js";
 import { getChannelMode, setChannelMode, SKALA_SYSTEM_PROMPT } from "./skala.js";
 import { commands } from "./commands/index.js";
@@ -225,7 +226,18 @@ async function generateTextResponse(
     content: h.text,
   }));
 
-  const userText = userMessage ? `[${username}]: ${userMessage}` : `[${username}]: Что на этом изображении?`;
+  let userText = userMessage ? `[${username}]: ${userMessage}` : `[${username}]: Что на этом изображении?`;
+  if (userMessage) {
+    const ghRepo = parseGitHubRepo(userMessage);
+    if (ghRepo) {
+      try {
+        const ghContext = await fetchGitHubRepoContext(ghRepo.owner, ghRepo.repo);
+        if (ghContext) {
+          userText += `\n\n${ghContext.context}`;
+        }
+      } catch {}
+    }
+  }
 
   if (images.length > 0) {
     messages.push({

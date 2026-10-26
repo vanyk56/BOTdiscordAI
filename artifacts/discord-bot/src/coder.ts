@@ -9,6 +9,7 @@ import {
 import { geminiJSON, MODEL_SKALA } from "./ai.js";
 import { Sandbox } from "novita-sandbox";
 import AdmZip from "adm-zip";
+import { parseGitHubRepo, fetchGitHubRepoContext, type GitHubRepoContext } from "./utils/github.js";
 
 export const OWNER_USER_ID = "1045717800519467081";
 
@@ -104,10 +105,27 @@ async function handleCoderInternal(
     : "River AI: GLM-5.3-Flash";
 
   try {
+    // ─── ШАГ 0: Обнаружение и выкачивание контекста GitHub репозитория ────────
+    const repoInfo = parseGitHubRepo(task) || (customRepo ? parseGitHubRepo(customRepo) : null);
+    let repoContextData: GitHubRepoContext | null = null;
+
+    if (repoInfo) {
+      await interaction.editReply(
+        `🔍 **[1/5] Загружаю репозиторий GitHub (${repoInfo.owner}/${repoInfo.repo})...**`
+      );
+      try {
+        repoContextData = await fetchGitHubRepoContext(repoInfo.owner, repoInfo.repo);
+      } catch (err) {
+        console.warn("[GitHub Load Warning]:", err);
+      }
+    }
+
     // ─── ШАГ 1: Проектирование кода через ИИ ──────────────────────────────────
-    await interaction.editReply(
-      `⏳ **[1/5] ${isUncensored ? "🔓 Uncensored " : ""}Архитектор проектирует код...** (${providerLabel})`
-    );
+    const archLabel = repoContextData
+      ? `⏳ **[1/5] ${isUncensored ? "🔓 Uncensored " : ""}Архитектор проектирует код на базе ${repoContextData.owner}/${repoContextData.repo}...** (${providerLabel})`
+      : `⏳ **[1/5] ${isUncensored ? "🔓 Uncensored " : ""}Архитектор проектирует код...** (${providerLabel})`;
+
+    await interaction.editReply(archLabel);
 
     const CODE_QUALITY_RULES = `
 ВАЖНЫЕ ПРАВИЛА КАЧЕСТВА КОДА:
@@ -186,13 +204,17 @@ ${CODE_QUALITY_RULES}
 }`;
 
     let project: GeneratedProject;
+    const promptWithRepo = repoContextData
+      ? `${repoContextData.context}\n\nТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`
+      : `ТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`;
+
     try {
       project = await geminiJSON<GeneratedProject>(
-        `ТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`,
+        promptWithRepo,
         targetModel,
         {
           systemInstruction: systemPrompt,
-          maxTokens: isUncensored ? 32768 : 100000,
+          maxTokens: isUncensored ? 16384 : 100000,
         }
       );
     } catch (llmErr: any) {
@@ -209,7 +231,11 @@ ${CODE_QUALITY_RULES}
       return;
     }
 
-    const repoName = (customRepo || project.projectName || "ai-agent-project")
+    const baseRepoName = (customRepo && !parseGitHubRepo(customRepo))
+      ? customRepo
+      : (repoContextData ? `${repoContextData.repo}-mod` : (project.projectName || "ai-agent-project"));
+
+    const repoName = baseRepoName
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, "-");
 
@@ -415,6 +441,14 @@ ${runStderr}
         text: `Разработано ${isUncensored ? "Uncensored " : ""}AI Agent • Модель: ${isUncensored ? "DeepSeek V4.1 Uncensored (Yeta)" : "GLM-5.3-Flash (River)"} • Sandbox: Novita Linux`,
       })
       .setTimestamp();
+
+    if (repoContextData) {
+      embed.addFields({
+        name: "🐙 Исходный репозиторий",
+        value: `[${repoContextData.owner}/${repoContextData.repo}](https://github.com/${repoContextData.owner}/${repoContextData.repo})`,
+        inline: true,
+      });
+    }
 
     if (repoUrl) {
       embed.addFields({

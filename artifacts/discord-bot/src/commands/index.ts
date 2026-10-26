@@ -24,14 +24,14 @@ export const commands = [
   new SlashCommandBuilder()
     .setName("coder")
     .setDescription("🤖 AI Агент: создать проект, протестировать в Linux MicroVM и запушить на GitHub")
-    .addStringOption((opt) => opt.setName("задача").setDescription("ТЗ: что нужно разработать").setRequired(true))
-    .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя репозитория GitHub (латиницей)").setRequired(false)),
+    .addStringOption((opt) => opt.setName("задача").setDescription("ТЗ: что сделать (можно вставить ссылку на GitHub)").setRequired(true))
+    .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя нового репо или ссылка на GitHub (owner/repo)").setRequired(false)),
 
   new SlashCommandBuilder()
     .setName("cuoder")
     .setDescription("🔓 Uncensored AI Coder (Yeta DeepSeek Uncensored) • Доступно только создателю")
-    .addStringOption((opt) => opt.setName("задача").setDescription("ТЗ: что нужно разработать без цензуры").setRequired(true))
-    .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя репозитория GitHub (латиницей)").setRequired(false)),
+    .addStringOption((opt) => opt.setName("задача").setDescription("ТЗ: что сделать без цензуры (можно вставить ссылку на GitHub)").setRequired(true))
+    .addStringOption((opt) => opt.setName("репозиторий").setDescription("Имя нового репо или ссылка на GitHub (owner/repo)").setRequired(false)),
 
   new SlashCommandBuilder()
     .setName("clear")
