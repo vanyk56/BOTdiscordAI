@@ -68,41 +68,50 @@ async function readSSEStream(response: Response): Promise<string> {
   let contentText = "";
   let reasoningText = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed === "data: [DONE]") continue;
-      if (trimmed.startsWith("data: ")) {
-        try {
-          const json = JSON.parse(trimmed.slice(6));
-          const delta = json.choices?.[0]?.delta;
-          if (typeof delta?.content === "string") {
-            contentText += delta.content;
-          }
-          if (typeof delta?.reasoning_content === "string") {
-            reasoningText += delta.reasoning_content;
-          }
-        } catch {}
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === "data: [DONE]") continue;
+        if (trimmed.startsWith("data: ")) {
+          try {
+            const json = JSON.parse(trimmed.slice(6));
+            const delta = json.choices?.[0]?.delta;
+            if (typeof delta?.content === "string") {
+              contentText += delta.content;
+            }
+            if (typeof delta?.reasoning_content === "string") {
+              reasoningText += delta.reasoning_content;
+            }
+          } catch {}
+        }
       }
     }
-  }
 
-  if (buffer.trim().startsWith("data: ") && buffer.trim() !== "data: [DONE]") {
-    try {
-      const json = JSON.parse(buffer.trim().slice(6));
-      const delta = json.choices?.[0]?.delta;
-      if (typeof delta?.content === "string") {
-        contentText += delta.content;
-      }
-      if (typeof delta?.reasoning_content === "string") {
-        reasoningText += delta.reasoning_content;
-      }
-    } catch {}
+    if (buffer.trim().startsWith("data: ") && buffer.trim() !== "data: [DONE]") {
+      try {
+        const json = JSON.parse(buffer.trim().slice(6));
+        const delta = json.choices?.[0]?.delta;
+        if (typeof delta?.content === "string") {
+          contentText += delta.content;
+        }
+        if (typeof delta?.reasoning_content === "string") {
+          reasoningText += delta.reasoning_content;
+        }
+      } catch {}
+    }
+  } catch (streamErr: any) {
+    // Если соединение оборвалось (ECONNRESET/terminated), но сервер уже успел прислать валидный кусок с кодом
+    if (contentText.trim().length > 100 && (contentText.includes("}") || contentText.includes("```"))) {
+      console.warn(`[AI Stream] Connection reset (${streamErr?.message || streamErr}), but received ${contentText.length} chars. Using partial content.`);
+      return contentText;
+    }
+    throw streamErr;
   }
 
   // Если модель прислала содержательный ответ (content), возвращаем только его!
@@ -148,8 +157,8 @@ export async function openrouterRequest(
   }
   finalMessages.push(...messages);
 
-  // Для Yeta AI потолок токенов 32768 (благодаря стримингу 524 исключён), для River AI 65536
-  const defaultMaxTokens = isSkala ? 32768 : parseInt(process.env.MAX_TOKENS ?? "65536", 10);
+  // Для Yeta AI потолок токенов 16384 (во избежание Cloudflare 524 и сброса соединения ECONNRESET), для River AI 65536
+  const defaultMaxTokens = isSkala ? 16384 : parseInt(process.env.MAX_TOKENS ?? "65536", 10);
   const useStream = options.stream ?? true; // Стриминг по умолчанию предотвращает тайм-аут Cloudflare 524
 
   const payload: Record<string, unknown> = {
@@ -158,7 +167,7 @@ export async function openrouterRequest(
     stream: useStream,
   };
   if (options.maxTokens !== undefined) {
-    payload.max_tokens = isSkala ? Math.min(options.maxTokens, 32768) : options.maxTokens;
+    payload.max_tokens = isSkala ? Math.min(options.maxTokens, 16384) : options.maxTokens;
   } else if (!isNaN(defaultMaxTokens) && defaultMaxTokens > 0) {
     payload.max_tokens = defaultMaxTokens;
   }
@@ -166,16 +175,15 @@ export async function openrouterRequest(
   if (options.temperature !== undefined) payload.temperature = options.temperature;
   if (options.responseFormat) payload.response_format = options.responseFormat;
 
-  let response: Response | null = null;
   let lastFetchError: any = null;
 
-  // Retry up to 3 times for network resilience
+  // Retry up to 3 times for network resilience (включая чтение стрима)
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 300_000);
 
-      response = await fetch(`${targetBaseUrl}/chat/completions`, {
+      const response = await fetch(`${targetBaseUrl}/chat/completions`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${targetApiKey}`,
@@ -187,127 +195,109 @@ export async function openrouterRequest(
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      break; // Received HTTP response
+
+      if (!response.ok) {
+        const errBody = await response.text();
+
+        // Авто-повтор при Cloudflare 524 Timeout
+        if (response.status === 524) {
+          console.warn(`[AI] Cloudflare 524 timeout on ${targetBaseUrl}. Retrying with lower tokens...`);
+          payload.stream = true;
+          payload.max_tokens = 8192;
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+        }
+
+        const isTokensError =
+          (response.status === 400 || response.status === 422) &&
+          (errBody.toLowerCase().includes("max_tokens") ||
+            errBody.toLowerCase().includes("maximum") ||
+            errBody.toLowerCase().includes("token") ||
+            errBody.toLowerCase().includes("context") ||
+            errBody.toLowerCase().includes("range"));
+
+        // Auto-retry if max_tokens was too large for server limits
+        if (isTokensError && typeof payload.max_tokens === "number" && payload.max_tokens > 4096) {
+          const numMatch = errBody.match(/(?:<=|less than or equal to|maximum(?: of)?|limit is|at most|exceeds|between)\s*(\d+)/i);
+          const safeLimit = numMatch && numMatch[1] ? parseInt(numMatch[1], 10) : 8192;
+          console.warn(`[AI] max_tokens ${payload.max_tokens} rejected. Retrying with ${safeLimit}...`);
+          payload.max_tokens = safeLimit;
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+        }
+
+        // Fallback check if requested model is unavailable
+        if (model !== FALLBACK_MODEL && !isSkala && (response.status === 404 || errBody.includes("not found"))) {
+          console.warn(`[AI] Model ${model} unavailable (${response.status}), falling back to ${FALLBACK_MODEL}`);
+          payload.model = FALLBACK_MODEL;
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+        }
+
+        const status = response.status;
+        const provider = isSkala ? "Yeta AI" : "River AI";
+        if (status === 524) {
+          throw new Error(`${provider} таймаут (Cloudflare 524: сервер Yeta AI не ответил вовремя). Попробуйте повторить запрос.`);
+        }
+        const cleanError = errBody.startsWith("<!DOCTYPE") ? "Сервер вернул HTML страницу ошибки (возможно, перегружен)" : errBody;
+        throw new Error(`${provider} API error (${status}): ${cleanError.slice(0, 300)}`);
+      }
+
+      // Успешный HTTP статус — читаем тело / стрим
+      const contentType = response.headers.get("content-type") || "";
+      let text = "";
+
+      if (contentType.includes("text/event-stream") || payload.stream === true) {
+        text = await readSSEStream(response);
+      } else {
+        const data = (await response.json()) as any;
+        const choice = data.choices?.[0];
+        const msg = choice?.message;
+
+        if (typeof msg?.content === "string" && msg.content.trim()) {
+          text = msg.content;
+        } else if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.trim()) {
+          text = msg.reasoning_content;
+        } else if (typeof choice?.text === "string" && choice.text.trim()) {
+          text = choice.text;
+        } else if (Array.isArray(msg?.content)) {
+          text = msg.content.map((p: any) => p.text || "").join("");
+        }
+      }
+
+      if (text && text.trim().length > 0) {
+        return text;
+      }
     } catch (err: any) {
       lastFetchError = err;
-      console.warn(`[AI] Attempt ${attempt}/3 fetch failed (${targetBaseUrl}):`, err?.message || err);
+      const errMsg = err?.message || String(err);
+      const isReset = errMsg.includes("ECONNRESET") || errMsg.includes("terminated") || errMsg.includes("hang up");
+      console.warn(`[AI] Attempt ${attempt}/3 failed (${targetBaseUrl}):`, errMsg);
+
+      // При разрыве соединения снижаем токены для снижения нагрузки на воркер Yeta
+      if (isReset && typeof payload.max_tokens === "number" && payload.max_tokens > 8192) {
+        payload.max_tokens = Math.floor(payload.max_tokens * 0.75);
+      }
 
       if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
       }
     }
   }
 
-  if (!response) {
-    const provider = isSkala ? "Yeta AI" : "River AI";
-    const causeMsg = lastFetchError?.cause?.message ? ` (${lastFetchError.cause.message})` : "";
-    throw new Error(`${provider} недоступен (${targetBaseUrl}): ${lastFetchError?.message || "fetch failed"}${causeMsg}`);
+  const provider = isSkala ? "Yeta AI" : "River AI";
+  const causeMsg = lastFetchError?.cause?.message ? ` (${lastFetchError.cause.message})` : "";
+  const baseMsg = lastFetchError?.message || "fetch failed";
+  if (baseMsg.includes("ECONNRESET") || causeMsg.includes("ECONNRESET") || baseMsg.includes("terminated")) {
+    throw new Error(`${provider} сбросил сетевое соединение (ECONNRESET / перегрузка воркера на сервере). Попробуйте повторить команду через минуту.`);
   }
-
-  if (!response.ok) {
-    const errBody = await response.text();
-
-    // Авто-повтор при Cloudflare 524 Timeout
-    if (response.status === 524) {
-      console.warn(`[AI] Cloudflare 524 timeout on ${targetBaseUrl}. Retrying with streaming and lower tokens...`);
-      payload.stream = true;
-      payload.max_tokens = 8192;
-      try {
-        response = await fetch(`${targetBaseUrl}/chat/completions`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${targetApiKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord.com",
-            "X-Title": "SWAGAgpt Discord Bot",
-          },
-          body: JSON.stringify(payload),
-        });
-      } catch {}
-    }
-
-    const isTokensError =
-      (response && (response.status === 400 || response.status === 422)) &&
-      (errBody.toLowerCase().includes("max_tokens") ||
-        errBody.toLowerCase().includes("maximum") ||
-        errBody.toLowerCase().includes("token") ||
-        errBody.toLowerCase().includes("context") ||
-        errBody.toLowerCase().includes("range"));
-
-    // Auto-retry if max_tokens was too large for server limits
-    if (isTokensError && typeof payload.max_tokens === "number" && payload.max_tokens > 4096) {
-      const numMatch = errBody.match(/(?:<=|less than or equal to|maximum(?: of)?|limit is|at most|exceeds|between)\s*(\d+)/i);
-      const safeLimit = numMatch && numMatch[1] ? parseInt(numMatch[1], 10) : 8192;
-      console.warn(`[AI] max_tokens ${payload.max_tokens} rejected. Retrying with ${safeLimit}...`);
-      payload.max_tokens = safeLimit;
-      try {
-        response = await fetch(`${targetBaseUrl}/chat/completions`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${targetApiKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord.com",
-            "X-Title": "SWAGAgpt Discord Bot",
-          },
-          body: JSON.stringify(payload),
-        });
-      } catch {}
-    }
-
-    // Fallback check if requested model is unavailable
-    if (response && !response.ok && model !== FALLBACK_MODEL && !isSkala) {
-      if (response.status === 404 || errBody.includes("not found")) {
-        console.warn(`[AI] Model ${model} unavailable (${response.status}), falling back to ${FALLBACK_MODEL}`);
-        payload.model = FALLBACK_MODEL;
-        try {
-          response = await fetch(`${targetBaseUrl}/chat/completions`, {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${targetApiKey}`,
-              "Content-Type": "application/json",
-              "HTTP-Referer": "https://discord.com",
-              "X-Title": "SWAGAgpt Discord Bot",
-            },
-            body: JSON.stringify(payload),
-          });
-        } catch {}
-      }
-    }
-
-    if (!response || !response.ok) {
-      const errorText = response ? await response.text().catch(() => errBody) : errBody;
-      const status = response ? response.status : 500;
-      const provider = isSkala ? "Yeta AI" : "River AI";
-      if (status === 524) {
-        throw new Error(`${provider} таймаут (Cloudflare 524: сервер Yeta AI не ответил вовремя). Попробуйте повторить запрос.`);
-      }
-      const cleanError = errorText.startsWith("<!DOCTYPE") ? "Сервер вернул HTML страницу ошибки (возможно, перегружен)" : errorText;
-      throw new Error(`${provider} API error (${status}): ${cleanError.slice(0, 300)}`);
-    }
-  }
-
-  const contentType = response.headers.get("content-type") || "";
-  let text = "";
-
-  if (contentType.includes("text/event-stream") || payload.stream === true) {
-    text = await readSSEStream(response);
-  } else {
-    const data = (await response.json()) as any;
-    const choice = data.choices?.[0];
-    const msg = choice?.message;
-
-    if (typeof msg?.content === "string" && msg.content.trim()) {
-      text = msg.content;
-    } else if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.trim()) {
-      text = msg.reasoning_content;
-    } else if (typeof choice?.text === "string" && choice.text.trim()) {
-      text = choice.text;
-    } else if (Array.isArray(msg?.content)) {
-      text = msg.content.map((p: any) => p.text || "").join("");
-    }
-  }
-
-  return text;
+  throw new Error(`${provider} недоступен (${targetBaseUrl}): ${baseMsg}${causeMsg}`);
 }
 
 /**
