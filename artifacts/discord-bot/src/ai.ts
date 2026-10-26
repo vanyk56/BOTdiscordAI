@@ -65,7 +65,8 @@ async function readSSEStream(response: Response): Promise<string> {
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  let fullText = "";
+  let contentText = "";
+  let reasoningText = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -80,8 +81,12 @@ async function readSSEStream(response: Response): Promise<string> {
         try {
           const json = JSON.parse(trimmed.slice(6));
           const delta = json.choices?.[0]?.delta;
-          const chunk = delta?.content || delta?.reasoning_content || "";
-          fullText += chunk;
+          if (typeof delta?.content === "string") {
+            contentText += delta.content;
+          }
+          if (typeof delta?.reasoning_content === "string") {
+            reasoningText += delta.reasoning_content;
+          }
         } catch {}
       }
     }
@@ -91,12 +96,23 @@ async function readSSEStream(response: Response): Promise<string> {
     try {
       const json = JSON.parse(buffer.trim().slice(6));
       const delta = json.choices?.[0]?.delta;
-      const chunk = delta?.content || delta?.reasoning_content || "";
-      fullText += chunk;
+      if (typeof delta?.content === "string") {
+        contentText += delta.content;
+      }
+      if (typeof delta?.reasoning_content === "string") {
+        reasoningText += delta.reasoning_content;
+      }
     } catch {}
   }
 
-  return fullText;
+  // Если модель прислала содержательный ответ (content), возвращаем только его!
+  // reasoning_content — это внутренние рассуждения CoT, их нельзя примешивать к контенту.
+  if (contentText.trim().length > 0) {
+    return contentText;
+  }
+
+  // Фолбэк: только если content пуст (модель выдала всё в reasoning), возвращаем reasoning
+  return reasoningText;
 }
 
 /**
@@ -316,51 +332,89 @@ export function extractAndParseJSON<T>(raw: string): T {
   // 1. Убираем блоки размышлений <think>...</think>
   let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-  // 2. Снимаем обёртку ```json ... ``` или ``` ... ``` (даже если закрывающий ``` отсутствует)
-  let content = text;
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/i);
-  if (fenceMatch && fenceMatch[1] && fenceMatch[1].trim()) {
-    content = fenceMatch[1].trim();
-  }
-
-  // 3. Если есть открывающая фигурная скобка '{', начинаем с неё
-  const firstBrace = content.indexOf("{");
-  if (firstBrace !== -1) {
-    content = content.substring(firstBrace).trim();
-  }
-
-  // 4. Попытка стандартного JSON.parse
+  // 2. Попытка распарсить текст напрямую (если модель выдала чистый JSON)
   try {
-    return JSON.parse(content) as T;
+    return JSON.parse(text) as T;
+  } catch {}
+  try {
+    return JSON.parse(jsonrepair(text)) as T;
   } catch {}
 
-  // 5. Попытка через jsonrepair (чинит незакрытые скобки, кавычки, висячие запятые)
-  try {
-    const repaired = jsonrepair(content);
-    return JSON.parse(repaired) as T;
-  } catch {}
+  const sanitizeCandidate = (str: string): string => {
+    return str
+      .replace(/\t/g, "  ")
+      .replace(/([,:{}\[\]])\s*\\n\s*/g, "$1\n");
+  };
 
-  // 6. Если в тексте есть закрывающая '}', пробуем срез между первой '{' и последней '}'
-  const lastBrace = content.lastIndexOf("}");
-  if (lastBrace !== -1 && lastBrace > 0) {
-    const sub = content.substring(0, lastBrace + 1);
+  const tryParse = (candidate: string): T | null => {
+    const trimmed = candidate.trim();
+    if (!trimmed) return null;
     try {
-      return JSON.parse(sub) as T;
+      return JSON.parse(trimmed) as T;
     } catch {}
     try {
-      return JSON.parse(jsonrepair(sub)) as T;
+      return JSON.parse(jsonrepair(trimmed)) as T;
     } catch {}
+    const sanitized = sanitizeCandidate(trimmed);
+    try {
+      return JSON.parse(sanitized) as T;
+    } catch {}
+    try {
+      return JSON.parse(jsonrepair(sanitized)) as T;
+    } catch {}
+    return null;
+  };
+
+  // 3. Поиск блоков ```json ... ``` или ``` ... ```
+  // ВАЖНО: Закрывающие ``` ищем С КОНЦА (lastIndexOf), так как внутри строковых значений JSON (например, README.md)
+  // почти всегда есть внутренние блоки ```bash, ```python и т.д.
+  const jsonBlockMatches = [...text.matchAll(/```(?:json)?\s*(\{[\s\S]*)/gi)];
+  for (let i = jsonBlockMatches.length - 1; i >= 0; i--) {
+    const match = jsonBlockMatches[i];
+    let candidate = match[1].trim();
+    const lastFence = candidate.lastIndexOf("```");
+    if (lastFence !== -1) {
+      candidate = candidate.substring(0, lastFence).trim();
+    }
+    const lastBrace = candidate.lastIndexOf("}");
+    if (lastBrace !== -1) {
+      candidate = candidate.substring(0, lastBrace + 1).trim();
+    }
+    const res = tryParse(candidate);
+    if (res !== null) return res;
   }
 
-  // 7. Пробуем jsonrepair на исходном тексте без очистки
-  try {
-    const repaired = jsonrepair(text);
-    return JSON.parse(repaired) as T;
-  } catch {}
+  // 4. Поиск внешних фигурных скобок { ... } (перебираем '{' слева направо до последней '}')
+  const lastBrace = text.lastIndexOf("}");
+  if (lastBrace !== -1) {
+    let searchIdx = 0;
+    while (searchIdx < lastBrace) {
+      const braceIdx = text.indexOf("{", searchIdx);
+      if (braceIdx === -1 || braceIdx >= lastBrace) break;
+      const candidate = text.substring(braceIdx, lastBrace + 1).trim();
+      const res = tryParse(candidate);
+      if (res !== null) return res;
+      searchIdx = braceIdx + 1;
+    }
+  }
 
-  // 8. Финальная попытка
+  // 5. Поиск массива [ ... ]
+  const lastBracket = text.lastIndexOf("]");
+  if (lastBracket !== -1) {
+    let searchIdx = 0;
+    while (searchIdx < lastBracket) {
+      const bracketIdx = text.indexOf("[", searchIdx);
+      if (bracketIdx === -1 || bracketIdx >= lastBracket) break;
+      const candidate = text.substring(bracketIdx, lastBracket + 1).trim();
+      const res = tryParse(candidate);
+      if (res !== null) return res;
+      searchIdx = bracketIdx + 1;
+    }
+  }
+
+  // Финальная попытка выбросит точную ошибку
   try {
-    return JSON.parse(content) as T;
+    return JSON.parse(text) as T;
   } catch (err: any) {
     console.error("[JSON Parse Error]. Raw response was:\n", raw.slice(0, 1000));
     throw new Error(`Ошибка парсинга JSON: ${err.message}`);
@@ -377,7 +431,7 @@ export async function geminiJSON<T>(
 ): Promise<T> {
   const maxTokens = options.maxTokens ?? parseInt(process.env.MAX_TOKENS ?? "100000", 10);
   const raw = await openrouterRequest(
-    [{ role: "user", content: prompt + "\n\nОтветь ТОЛЬКО валидным JSON без лишнего текста и без markdown." }],
+    [{ role: "user", content: prompt + "\n\nОтветь ТОЛЬКО валидным JSON-объектом." }],
     model,
     {
       maxTokens,
