@@ -322,7 +322,10 @@ ${runStderr}
 }`;
 
           try {
-            const fixResult = await geminiJSON<{ fixedCode: string }>(fixPrompt, targetModel);
+            // Строгий таймаут 35 секунд на авто-фикс, чтобы не блокировать бота и уложиться в лимит Discord (15 мин)
+            const fixTimeout = new Promise<null>((r) => setTimeout(() => r(null), 35_000));
+            const fixPromise = geminiJSON<{ fixedCode: string }>(fixPrompt, targetModel, { maxTokens: 8192 });
+            const fixResult = await Promise.race([fixPromise, fixTimeout]);
             if (fixResult?.fixedCode) {
               project.files[entry] = fixResult.fixedCode;
               await sbx.files.write(`${workdir}/${entry}`, fixResult.fixedCode);

@@ -60,7 +60,7 @@ export function isSkalaTarget(model: string): boolean {
   );
 }
 
-async function readSSEStream(response: Response): Promise<string> {
+async function readSSEStream(response: Response, abortSignal?: AbortSignal): Promise<string> {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
@@ -68,9 +68,25 @@ async function readSSEStream(response: Response): Promise<string> {
   let contentText = "";
   let reasoningText = "";
 
+  // Защита от вечного зависания: если между чанками проходит > 25с, прерываем чтение
+  const readWithIdleTimeout = async (timeoutMs = 25_000): Promise<{ done: boolean; value?: Uint8Array }> => {
+    let timer: NodeJS.Timeout;
+    const timeoutPromise = new Promise<{ done: boolean; value?: Uint8Array }>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("SSE stream idle timeout (сервер перестал слать данные)")), timeoutMs);
+    });
+    try {
+      return await Promise.race([reader.read(), timeoutPromise]);
+    } finally {
+      clearTimeout(timer!);
+    }
+  };
+
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      if (abortSignal?.aborted) {
+        throw new Error("Запрос отменён по общему таймауту");
+      }
+      const { done, value } = await readWithIdleTimeout(25_000);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
@@ -106,21 +122,18 @@ async function readSSEStream(response: Response): Promise<string> {
       } catch {}
     }
   } catch (streamErr: any) {
-    // Если соединение оборвалось (ECONNRESET/terminated), но сервер уже успел прислать валидный кусок с кодом
+    // Если соединение оборвалось или заглохло по таймауту, но сервер уже передал проект
     if (contentText.trim().length > 100 && (contentText.includes("}") || contentText.includes("```"))) {
-      console.warn(`[AI Stream] Connection reset (${streamErr?.message || streamErr}), but received ${contentText.length} chars. Using partial content.`);
+      console.warn(`[AI Stream] Stream ended (${streamErr?.message || streamErr}), but received ${contentText.length} chars. Using partial content.`);
       return contentText;
     }
     throw streamErr;
   }
 
-  // Если модель прислала содержательный ответ (content), возвращаем только его!
-  // reasoning_content — это внутренние рассуждения CoT, их нельзя примешивать к контенту.
   if (contentText.trim().length > 0) {
     return contentText;
   }
 
-  // Фолбэк: только если content пуст (модель выдала всё в reasoning), возвращаем reasoning
   return reasoningText;
 }
 
@@ -181,20 +194,22 @@ export async function openrouterRequest(
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 300_000);
+      // Максимум 150 секунд на попытку (включая чтение стрима)
+      const timeout = setTimeout(() => controller.abort(), 150_000);
+      let response: Response;
 
-      const response = await fetch(`${targetBaseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${targetApiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://discord.com",
-          "X-Title": "SWAGAgpt Discord Bot",
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      try {
+        response = await fetch(`${targetBaseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${targetApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://discord.com",
+            "X-Title": "SWAGAgpt Discord Bot",
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
 
       if (!response.ok) {
         const errBody = await response.text();
@@ -254,7 +269,7 @@ export async function openrouterRequest(
       let text = "";
 
       if (contentType.includes("text/event-stream") || payload.stream === true) {
-        text = await readSSEStream(response);
+        text = await readSSEStream(response, controller.signal);
       } else {
         const data = (await response.json()) as any;
         const choice = data.choices?.[0];
@@ -273,6 +288,9 @@ export async function openrouterRequest(
 
       if (text && text.trim().length > 0) {
         return text;
+      }
+      } finally {
+        clearTimeout(timeout);
       }
     } catch (err: any) {
       lastFetchError = err;
