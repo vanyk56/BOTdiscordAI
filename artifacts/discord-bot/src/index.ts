@@ -24,7 +24,7 @@ import {
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseGitHubRepo, fetchGitHubRepoContext } from "./utils/github.js";
-import { ai, geminiText, geminiGenerateImage, geminiEditImage, openrouterChat, MODEL_CHAT, MODEL_SKALA, type OpenRouterMessage } from "./ai.js";
+import { ai, geminiText, geminiGenerateImage, prepareImagePrompt, geminiEditImage, openrouterChat, MODEL_CHAT, MODEL_SKALA, type OpenRouterMessage } from "./ai.js";
 import { getChannelMode, setChannelMode, SKALA_SYSTEM_PROMPT } from "./skala.js";
 import { commands } from "./commands/index.js";
 import { handleTrivia } from "./games/trivia.js";
@@ -566,17 +566,32 @@ async function handleImagine(interaction: ChatInputCommandInteraction) {
   const prompt = interaction.options.getString("описание", true);
   await interaction.deferReply();
   try {
-    const result = await geminiGenerateImage(prompt);
+    const check = await prepareImagePrompt(prompt);
+    if (!check.allowed) {
+      await interaction.editReply(
+        check.rejectionReason ||
+          "❌ Я не могу нарисовать такое изображение. Запросы с откровенным, сексуальным (18+) или запрещённым контентом отклоняются правилами безопасности Discord."
+      );
+      return;
+    }
+
+    const result = await geminiGenerateImage(check.enhancedPrompt);
     if (result) {
       const ext = mimeToExtension(result.mimeType);
+      const shortPrompt =
+        check.enhancedPrompt.length > 250
+          ? check.enhancedPrompt.slice(0, 247) + "..."
+          : check.enhancedPrompt;
+
       await interaction.editReply({
-        content: `🎨 **${prompt}**`,
+        content: `🎨 **${prompt}**\n-# 🪄 *Промпт для ИИ: ${shortPrompt}*`,
         files: [new AttachmentBuilder(result.buffer, { name: `generated.${ext}` })],
       });
     } else {
       await interaction.editReply("Не смог создать изображение. Попробуй описать по-другому!");
     }
-  } catch {
+  } catch (err) {
+    console.error("[handleImagine] Error:", err);
     await interaction.editReply("Ошибка при создании изображения. Попробуй ещё раз!");
   }
 }
@@ -1275,11 +1290,29 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
     // Generate image
     if (content && isImageGenerationRequest(content) && !hasImages) {
-      const result = await geminiGenerateImage(content);
+      const check = await prepareImagePrompt(content);
+      if (!check.allowed) {
+        stopTyping();
+        await message.reply(
+          check.rejectionReason ||
+            "❌ Я не могу нарисовать такое изображение. Запросы с откровенным, сексуальным (18+) или запрещённым контентом отклоняются правилами безопасности Discord."
+        );
+        return;
+      }
+
+      const result = await geminiGenerateImage(check.enhancedPrompt);
       stopTyping();
       if (result) {
         const ext = mimeToExtension(result.mimeType);
-        await message.reply({ content: "🎨 Держи!", files: [new AttachmentBuilder(result.buffer, { name: `generated.${ext}` })] });
+        const shortPrompt =
+          check.enhancedPrompt.length > 250
+            ? check.enhancedPrompt.slice(0, 247) + "..."
+            : check.enhancedPrompt;
+
+        await message.reply({
+          content: `🎨 **${content}**\n-# 🪄 *Промпт для ИИ: ${shortPrompt}*`,
+          files: [new AttachmentBuilder(result.buffer, { name: `generated.${ext}` })],
+        });
       } else {
         await message.reply("Не смог создать изображение. Попробуй описать по-другому!");
       }

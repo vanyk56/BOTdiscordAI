@@ -514,6 +514,200 @@ async function fetchImageFromUrl(url: string): Promise<{ buffer: Buffer; mimeTyp
   }
 }
 
+export interface ImagePromptResult {
+  allowed: boolean;
+  enhancedPrompt: string;
+  reason?: string;
+  rejectionReason?: string;
+  originalPrompt: string;
+}
+
+// Закодированный список маркеров нежелательного контента (NSFW / 18+ / нецензурная лексика)
+const MODERATION_PATTERNS_B64 = [
+  "0L/QuNGB0Y4=", // pis-yu
+  "0L/QuNGB0LXRhw==", // pis-ech
+  "0L/QuNGB0YzQug==", // pis-k
+  "0YfQu9C10L0=", // ch-len
+  "0L/QtdC90LjRgQ==", // pe-nis
+  "0YXRg9C5", // khu-y
+  "0YXRg9GP", // khu-ya
+  "0YXRg9C1", // khu-ye
+  "0LLQsNCz0LjQvQ==", // vag-in
+  "0L/QuNC30LQ=", // piz-d
+  "0LTQuNC70YzQtA==", // dil-do
+  "0L/QvtGA0L3Qvg==", // por-no
+  "0YXQtdC90YLQsNC5", // hen-tai
+  "0YHQtdC60YE=", // se-ks
+  "0YLRgNCw0YU=", // tra-kh
+  "0LXQsdC7", // ye-bl
+  "0LzQuNC90LXRgg==", // mi-net
+  "0LTRgNC+0Yc=", // dro-ch
+  "0YjQu9GO0YU=", // shlyu-kh
+  "0L/QtdC00L7RhNC40Ls=", // ped-ofil
+  "0YDQsNGB0YfQu9C10L0=", // ras-chlen
+  "0LPRg9GA0L4=", // gu-ro
+  "0YHRg9C40YbQuNC0", // sui-tsid
+  "bnNmdw==", // n-s-f-w
+  "bnVkZQ==", // nu-de
+  "bmFrZWQ=", // na-ked
+  "cG9ybg==", // po-rn
+  "aGVudGFp", // hen-tai
+  "Y29jaw==", // co-ck
+  "ZGljaw==", // di-ck
+  "cGVuaXM=", // pe-nis
+  "dmFnaW5h", // vag-ina
+  "cHVzc3k=", // pus-sy
+  "Ym9vYnM=", // boo-bs
+  "dGl0cw==", // ti-ts
+  "Ymxvd2pvYg==", // blow-job
+  "Z29yZQ==", // go-re
+];
+
+const MODERATION_KEYWORDS = MODERATION_PATTERNS_B64.map((b) =>
+  Buffer.from(b, "base64").toString("utf-8")
+);
+
+/**
+ * Быстрый фильтр очевидного NSFW, нежелательной лексики и запрещённого контента
+ */
+function checkQuickModeration(text: string): boolean {
+  // Нормализация схожих латинских символов и цифр в кириллицу
+  const normalized = text
+    .toLowerCase()
+    .replace(/@/g, "а")
+    .replace(/0/g, "о")
+    .replace(/1/g, "и")
+    .replace(/3/g, "з")
+    .replace(/4/g, "ч")
+    .replace(/u/g, "и")
+    .replace(/y/g, "у")
+    .replace(/e/g, "е")
+    .replace(/a/g, "а")
+    .replace(/o/g, "о")
+    .replace(/p/g, "р")
+    .replace(/c/g, "с")
+    .replace(/x/g, "х")
+    .replace(/b/g, "б")
+    .replace(/k/g, "к")
+    .replace(/m/g, "м")
+    .replace(/t/g, "т")
+    .replace(/[\s\-_.,!?:;*()]+/g, " ");
+
+  return MODERATION_KEYWORDS.some((kw) => normalized.includes(kw));
+}
+
+function cleanBasicPrompt(text: string): string {
+  return (
+    text
+      .replace(/^(?:нарисуй|создай|сгенерируй|сделай)\s+(?:мне\s+)?(?:картинку|изображение|фото|арт)?\s*/i, "")
+      .trim() || text
+  );
+}
+
+const IMAGE_PROMPT_INSTRUCTION = `Ты — эксперт-модератор и арт-директор (промпт-инженер) для генератора изображений Flux.1 / SDXL.
+Твоя задача — проверить запрос пользователя на безопасность и, если он безопасен, составить детальный художественный промпт на английском языке для генерации красивого изображения.
+
+ПРАВИЛО 1: МОДЕРАЦИЯ И БЕЗОПАСНОСТЬ (NSFW / ЗАПРЕЩЁННЫЙ КОНТЕНТ):
+Ты ОБЯЗАН отклонить запрос (allowed = false), если в нём присутствует:
+- Любой эротический или 18+ контент, интимные части тела, нагота, порнография, сексуальные намёки, нецензурная брань.
+- Жестокость, насилие, кровь, самоповреждение.
+- Эксплуатация несовершеннолетних — абсолютный запрет.
+- Разжигание ненависти, экстремизм, враждебные высказывания.
+
+Если запрос нарушает правила безопасности:
+{
+  "allowed": false,
+  "reason": "❌ Я не могу нарисовать такое изображение. Запросы с откровенным, сексуальным (18+) или запрещённым контентом отклоняются правилами безопасности Discord. Попробуй придумать другой сюжет!",
+  "enhancedPrompt": ""
+}
+
+ПРАВИЛО 2: ЕСЛИ ЗАПРОС БЕЗОПАСЕН (allowed = true):
+- Переведи запрос на английский язык.
+- Очисти его от вводных слов пользователя ("нарисуй", "сгенерируй", "draw", "make an image").
+- Обогати деталями для генератора изображений Flux (Prompt Expansion):
+  - Главный объект/персонаж, его поза, ракурс, фактура, детали.
+  - Окружение, фон, задний план.
+  - Освещение и атмосфера (например: cinematic lighting, soft shadows, volumetric rays, neon glow, golden hour).
+  - Художественный стиль (если указан anime, photorealistic, cyberpunk, fantasy, oil painting — строго соблюдай его; если не указан — сделай качественный атмосферный кинематографичный арт).
+  - Качественные дескрипторы: "detailed, 8k resolution, masterpiece, intricate composition".
+- Длина enhancedPrompt: 2-4 предложения на английском языке.
+
+{
+  "allowed": true,
+  "reason": "",
+  "enhancedPrompt": "<детальный промпт на английском языке>"
+}
+
+Отвечай СТРОГО валидным JSON-объектом без лишнего текста.`;
+
+/**
+ * Подготовка промпта для генерации: проверка на запретки и обогащение деталями через ИИ
+ */
+export async function prepareImagePrompt(userPrompt: string): Promise<ImagePromptResult> {
+  const trimmed = userPrompt.trim();
+  if (!trimmed) {
+    const reason = "❌ Промпт не может быть пустым. Опиши, что ты хочешь нарисовать!";
+    return {
+      allowed: false,
+      reason,
+      rejectionReason: reason,
+      enhancedPrompt: "",
+      originalPrompt: userPrompt,
+    };
+  }
+
+  // Быстрый локальный фильтр очевидных запреток
+  if (checkQuickModeration(trimmed)) {
+    const reason =
+      "❌ Я не могу нарисовать такое изображение. Запросы с откровенным, сексуальным (18+) или запрещённым контентом отклоняются правилами безопасности Discord. Попробуй придумать другой сюжет!";
+    return {
+      allowed: false,
+      reason,
+      rejectionReason: reason,
+      enhancedPrompt: "",
+      originalPrompt: userPrompt,
+    };
+  }
+
+  try {
+    const response = await geminiJSON<{ allowed?: boolean; reason?: string; enhancedPrompt?: string }>(
+      `Запрос пользователя на изображение:\n"${trimmed}"`,
+      MODEL_UTILS,
+      {
+        systemInstruction: IMAGE_PROMPT_INSTRUCTION,
+        maxTokens: 600,
+      }
+    );
+
+    if (response.allowed === false) {
+      const reason =
+        response.reason ||
+        "❌ Запрос отклонён модерацией по правилам безопасности Discord. Попробуй изменить описание!";
+      return {
+        allowed: false,
+        reason,
+        rejectionReason: reason,
+        enhancedPrompt: "",
+        originalPrompt: userPrompt,
+      };
+    }
+
+    const enhanced = response.enhancedPrompt?.trim() || cleanBasicPrompt(trimmed);
+    return {
+      allowed: true,
+      enhancedPrompt: enhanced,
+      originalPrompt: userPrompt,
+    };
+  } catch (err) {
+    console.warn("[prepareImagePrompt] Model prompt expansion failed, falling back to basic prompt:", err);
+    return {
+      allowed: true,
+      enhancedPrompt: cleanBasicPrompt(trimmed),
+      originalPrompt: userPrompt,
+    };
+  }
+}
+
 /**
  * Image generation
  */
@@ -521,66 +715,79 @@ export async function geminiGenerateImage(
   prompt: string
 ): Promise<{ buffer: Buffer; mimeType: string } | null> {
   try {
+    let finalPrompt = prompt.trim();
+    // Защитный слой: если промпт содержит русские буквы или не был обработан
+    if (/[а-яё]/i.test(finalPrompt)) {
+      const check = await prepareImagePrompt(finalPrompt);
+      if (!check.allowed) {
+        console.warn("[Image] Prompt rejected by safety filter:", finalPrompt);
+        return null;
+      }
+      finalPrompt = check.enhancedPrompt;
+    }
+
     const targetUrl = IMAGE_BASE_URL;
     const targetKey = IMAGE_API_KEY;
-    if (!targetKey) {
-      console.warn("[Image] No IMAGE_API_KEY or RIVER_API_KEY set for image generation.");
-      return null;
-    }
 
-    const response = await fetch(`${targetUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${targetKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://discord.com",
-        "X-Title": "SWAGAgpt Discord Bot",
-      },
-      body: JSON.stringify({
-        model: MODEL_IMAGE,
-        messages: [{ role: "user", content: prompt }],
-        modalities: ["image", "text"],
-      }),
-    });
+    if (targetKey) {
+      try {
+        const response = await fetch(`${targetUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${targetKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://discord.com",
+            "X-Title": "SWAGAgpt Discord Bot",
+          },
+          body: JSON.stringify({
+            model: MODEL_IMAGE,
+            messages: [{ role: "user", content: finalPrompt }],
+            modalities: ["image", "text"],
+          }),
+        });
 
-    if (response.ok) {
-      const data = (await response.json()) as any;
-      const content = data.choices?.[0]?.message?.content ?? "";
-      const parsed = await fetchImageFromResponse(content, data.choices);
-      if (parsed) return parsed;
-    }
+        if (response.ok) {
+          const data = (await response.json()) as any;
+          const content = data.choices?.[0]?.message?.content ?? "";
+          const parsed = await fetchImageFromResponse(content, data.choices);
+          if (parsed) return parsed;
+        }
 
-    const imgResponse = await fetch(`${targetUrl}/images/generations`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${targetKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL_IMAGE,
-        prompt: prompt,
-        n: 1,
-      }),
-    });
+        const imgResponse = await fetch(`${targetUrl}/images/generations`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${targetKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: MODEL_IMAGE,
+            prompt: finalPrompt,
+            n: 1,
+          }),
+        });
 
-    if (imgResponse.ok) {
-      const imgData = (await imgResponse.json()) as { data?: Array<{ url?: string; b64_json?: string }> };
-      const item = imgData.data?.[0];
-      if (item?.url) {
-        return fetchImageFromUrl(item.url);
-      } else if (item?.b64_json) {
-        return {
-          buffer: Buffer.from(item.b64_json, "base64"),
-          mimeType: "image/png",
-        };
+        if (imgResponse.ok) {
+          const imgData = (await imgResponse.json()) as { data?: Array<{ url?: string; b64_json?: string }> };
+          const item = imgData.data?.[0];
+          if (item?.url) {
+            return fetchImageFromUrl(item.url);
+          } else if (item?.b64_json) {
+            return {
+              buffer: Buffer.from(item.b64_json, "base64"),
+              mimeType: "image/png",
+            };
+          }
+        }
+      } catch (primaryErr) {
+        console.warn("[Image] Primary image API failed, falling back to Flux:", primaryErr);
       }
     }
 
-    // ─── 3. Резервный генератор FLUX (Pollinations AI — 100% бесплатно, быстрый GPU-инференс) ───
+    // ─── Резервный генератор FLUX (Pollinations AI — быстрый качественный GPU-инференс) ───
     try {
-      const encodedPrompt = encodeURIComponent(prompt.slice(0, 1000));
+      const encodedPrompt = encodeURIComponent(finalPrompt.slice(0, 1000));
       const fluxUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=1024&height=1024&nologo=true`;
-      const fluxRes = await fetch(fluxUrl, { signal: AbortSignal.timeout(30_000) });
+      const fluxRes = await fetch(fluxUrl, { signal: AbortSignal.timeout(35_000) });
       if (fluxRes.ok) {
         const arrayBuf = await fluxRes.arrayBuffer();
         const contentType = fluxRes.headers.get("content-type") ?? "image/jpeg";
@@ -596,20 +803,6 @@ export async function geminiGenerateImage(
     return null;
   } catch (error) {
     console.error("[Image] Image generation error:", error);
-    // Попытка Flux при любой ошибке первичного API
-    try {
-      const encodedPrompt = encodeURIComponent(prompt.slice(0, 1000));
-      const fluxUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=1024&height=1024&nologo=true`;
-      const fluxRes = await fetch(fluxUrl, { signal: AbortSignal.timeout(30_000) });
-      if (fluxRes.ok) {
-        const arrayBuf = await fluxRes.arrayBuffer();
-        const contentType = fluxRes.headers.get("content-type") ?? "image/jpeg";
-        return {
-          buffer: Buffer.from(arrayBuf),
-          mimeType: contentType.split(";")[0]!,
-        };
-      }
-    } catch {}
     return null;
   }
 }
