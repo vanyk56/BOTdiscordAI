@@ -948,8 +948,11 @@ client.once(Events.ClientReady, async (readyClient) => {
   writeBotStatus("online");
   setInterval(() => writeBotStatus("online"), 15_000);
   const statuses = [
+    { name: "команды | /help", type: ActivityType.Listening },
+    { name: "🎨 /imagine (Flux ИИ)", type: ActivityType.Playing },
+    { name: "💻 /coder & /cuoder", type: ActivityType.Playing },
     { name: "🎮 /trivia /quest /duel", type: ActivityType.Playing },
-    { name: "funpay.com/users/11974380/", type: ActivityType.Watching },
+    { name: "за чатом | @SwagaAI", type: ActivityType.Watching },
   ];
   let statusIndex = 0;
   readyClient.user.setActivity(statuses[statusIndex]);
