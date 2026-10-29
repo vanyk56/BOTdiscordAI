@@ -51,9 +51,12 @@ async function uploadFilesToGitHub(
   repo: string,
   files: Record<string, string>
 ): Promise<boolean> {
+  let uploadedCount = 0;
+  const entries = Object.entries(files);
   try {
-    for (const [filePath, content] of Object.entries(files)) {
-      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
+    for (const [filePath, content] of entries) {
+      const cleanPath = filePath.replace(/^\/+/, "");
+      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`;
       let sha: string | undefined;
       try {
         const getRes = await fetch(url, {
@@ -68,7 +71,7 @@ async function uploadFilesToGitHub(
         }
       } catch {}
 
-      await fetch(url, {
+      const putRes = await fetch(url, {
         method: "PUT",
         headers: {
           "Authorization": `Bearer ${token}`,
@@ -77,13 +80,24 @@ async function uploadFilesToGitHub(
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          message: `Add ${filePath} via AI Agent`,
-          content: Buffer.from(content).toString("base64"),
+          message: `Add ${cleanPath} via AI Agent`,
+          content: Buffer.from(content, "utf-8").toString("base64"),
+          branch: "main",
           ...(sha ? { sha } : {}),
         }),
       });
+
+      if (!putRes.ok) {
+        const errText = await putRes.text();
+        console.error(
+          `[GitHub API] Failed to upload ${cleanPath} (status ${putRes.status}): ${errText.slice(0, 300)}`
+        );
+      } else {
+        uploadedCount++;
+      }
     }
-    return true;
+    console.log(`[GitHub API] Uploaded ${uploadedCount}/${entries.length} files to ${owner}/${repo}`);
+    return uploadedCount > 0;
   } catch (err) {
     console.error("[GitHub API] uploadFiles error:", err);
     return false;
@@ -403,6 +417,8 @@ ${runStderr}
       try {
         const created = await createGitHubRepo(ghToken, repoName, project.description);
         if (created) {
+          // Даем GitHub 2 секунды на инициализацию ветки main из auto_init
+          await new Promise((r) => setTimeout(r, 2000));
           const uploaded = await uploadFilesToGitHub(ghToken, ghUser, repoName, project.files);
           if (uploaded) {
             repoUrl = `https://github.com/${ghUser}/${repoName}`;
