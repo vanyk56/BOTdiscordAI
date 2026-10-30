@@ -460,13 +460,42 @@ export function extractAndParseJSON<T>(raw: string): T {
     }
   }
 
-  // Финальная попытка выбросит точную ошибку
-  try {
-    return JSON.parse(text) as T;
-  } catch (err: any) {
-    console.error("[JSON Parse Error]. Raw response was:\n", raw.slice(0, 1000));
-    throw new Error(`Ошибка парсинга JSON: ${err.message}`);
+  // 6. Умный перехват блоков кода ```lang ... ``` если модель ответила в формате markdown вместо строгого JSON
+  const codeBlockRegex = /```([a-zA-Z0-9_-]*)\s*([\s\S]*?)```/g;
+  const foundCodeBlocks: Array<{ lang: string; code: string }> = [];
+  let cbMatch: RegExpExecArray | null;
+  while ((cbMatch = codeBlockRegex.exec(text)) !== null) {
+    const lang = (cbMatch[1] || "").toLowerCase().trim();
+    const code = cbMatch[2].trim();
+    if (code && !["json"].includes(lang)) {
+      foundCodeBlocks.push({ lang, code });
+    }
   }
+
+  if (foundCodeBlocks.length > 0) {
+    const virtualFiles: Record<string, string> = {};
+    for (let idx = 0; idx < foundCodeBlocks.length; idx++) {
+      const { lang, code } = foundCodeBlocks[idx];
+      let fname = `file_${idx + 1}.txt`;
+      if (lang === "bat" || lang === "cmd") fname = idx === 0 ? "script.bat" : `script_${idx + 1}.bat`;
+      else if (lang === "python" || lang === "py") fname = idx === 0 ? "main.py" : `module_${idx + 1}.py`;
+      else if (lang === "javascript" || lang === "js") fname = idx === 0 ? "index.js" : `script_${idx + 1}.js`;
+      else if (lang === "html") fname = "index.html";
+      else if (lang === "css") fname = "styles.css";
+      else if (lang === "sh" || lang === "bash") fname = idx === 0 ? "run.sh" : `script_${idx + 1}.sh`;
+      virtualFiles[fname] = code;
+    }
+    return {
+      projectName: "extracted-project",
+      description: "Код извлечён из ответа нейросети",
+      entrypoint: Object.keys(virtualFiles)[0] || "script.bat",
+      files: virtualFiles,
+    } as unknown as T;
+  }
+
+  // Если модель ответила просто текстом (отказ, объяснение, приветствие)
+  const preview = text.replace(/[\r\n]+/g, " ").slice(0, 150).trim();
+  throw new Error(`Нейросеть ответила текстовым сообщением вместо JSON-кода: "${preview}..."`);
 }
 
 /**

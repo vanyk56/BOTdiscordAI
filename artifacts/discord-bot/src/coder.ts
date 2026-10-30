@@ -29,6 +29,61 @@ interface GeneratedProject {
   files: Record<string, string>;
 }
 
+function normalizeProject(rawObj: any, defaultTask = ""): GeneratedProject {
+  if (!rawObj || typeof rawObj !== "object") {
+    return { projectName: "ai-project", description: "Проект", entrypoint: "index.html", files: {} };
+  }
+  let files: Record<string, string> = {};
+  if (rawObj.files && typeof rawObj.files === "object" && !Array.isArray(rawObj.files)) {
+    for (const [k, v] of Object.entries(rawObj.files)) {
+      if (typeof v === "string" && v.trim()) files[k.trim()] = v;
+    }
+  } else if (Array.isArray(rawObj.files)) {
+    for (const item of rawObj.files) {
+      const name = item.name || item.path || item.filename;
+      const content = item.content || item.code || "";
+      if (name && typeof content === "string") files[name.trim()] = content;
+    }
+  }
+
+  // Если файлов нет в .files, но есть ключи с расширениями в корне (.py, .js, .html, .bat, .sh, .json, .txt, .css, .md)
+  for (const [key, val] of Object.entries(rawObj)) {
+    if (typeof val === "string" && val.trim() && (key.includes(".") || key.toLowerCase().includes("readme"))) {
+      if (!["projectName", "description", "entrypoint", "requirements"].includes(key)) {
+        files[key.trim()] = val;
+      }
+    }
+  }
+
+  // Если файлов всё ещё 0, но есть 'code' или 'script'
+  if (Object.keys(files).length === 0) {
+    const singleCode = rawObj.code || rawObj.script || rawObj.content;
+    if (typeof singleCode === "string" && singleCode.trim()) {
+      const isBat = defaultTask.toLowerCase().includes("батник") || defaultTask.toLowerCase().includes(".bat");
+      const defaultFilename = isBat ? "script.bat" : "main.py";
+      files[defaultFilename] = singleCode;
+    }
+  }
+
+  let ep = rawObj.entrypoint || "";
+  if (!ep || !files[ep]) {
+    if (files["index.html"]) ep = "index.html";
+    else if (files["main.py"]) ep = "main.py";
+    else if (files["index.js"]) ep = "index.js";
+    else if (files["script.bat"]) ep = "script.bat";
+    else if (Object.keys(files).length > 0) ep = Object.keys(files)[0];
+    else ep = "index.html";
+  }
+
+  return {
+    projectName: (rawObj.projectName || "ai-project").toLowerCase().replace(/[^a-z0-9_-]/g, "-"),
+    description: rawObj.description || "Автоматически сгенерированный проект",
+    entrypoint: ep,
+    requirements: rawObj.requirements || "",
+    files,
+  };
+}
+
 async function createGitHubRepo(token: string, repoName: string, description: string): Promise<boolean> {
   const auth = token.startsWith("ghp_") ? `token ${token}` : `Bearer ${token}`;
   try {
@@ -629,13 +684,9 @@ ${CODE_QUALITY_RULES}
         try {
           const rawResult = await sbx.files.read("/home/user/hermes_result.json");
           const parsedResult = JSON.parse(rawResult);
-          if (parsedResult.files && Object.keys(parsedResult.files).length > 0) {
-            project = {
-              projectName: "",
-              description: parsedResult.summary || "Проект успешно разработан и проверен Hermes Agent в Ubuntu MicroVM",
-              entrypoint: parsedResult.entrypoint || "index.html",
-              files: parsedResult.files,
-            };
+          const normalizedHermes = normalizeProject(parsedResult, task);
+          if (normalizedHermes.files && Object.keys(normalizedHermes.files).length > 0) {
+            project = normalizedHermes;
             isHermesUsed = true;
             const logSnippet = (parsedResult.logs || agentRunRes.stdout || "Успешно").slice(0, 500);
             sandboxStatusText = `🤖 **Hermes Agent (Ubuntu MicroVM):**\nУспешно завершил разработку за ${parsedResult.steps || 1} шагов!\n\`\`\`bash\n${logSnippet}\n\`\`\``;
@@ -653,7 +704,7 @@ ${CODE_QUALITY_RULES}
       await interaction.editReply(`⏳ **[3/5] Архитектор проектирует код...** (${providerLabel})`);
 
       try {
-        project = await geminiJSON<GeneratedProject>(
+        const rawGen = await geminiJSON<any>(
           promptWithRepo,
           targetModel,
           {
@@ -661,6 +712,7 @@ ${CODE_QUALITY_RULES}
             maxTokens: 16384,
           }
         );
+        project = normalizeProject(rawGen, task);
       } catch (llmErr: any) {
         console.error(`[${providerLabel} Code Generation Error]:`, llmErr);
         const causeMsg = llmErr?.cause?.message ? ` (${llmErr.cause.message})` : "";
