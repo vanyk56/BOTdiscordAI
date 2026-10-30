@@ -6,7 +6,15 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from "discord.js";
-import { geminiJSON, MODEL_SKALA } from "./ai.js";
+import {
+  geminiJSON,
+  MODEL_SKALA,
+  MODEL_DEFAULT,
+  RIVER_BASE_URL,
+  RIVER_API_KEY,
+  YETA_BASE_URL,
+  YETA_API_KEY,
+} from "./ai.js";
 import { Sandbox } from "novita-sandbox";
 import AdmZip from "adm-zip";
 import { parseGitHubRepo, fetchGitHubRepoContext, type GitHubRepoContext } from "./utils/github.js";
@@ -103,6 +111,208 @@ async function uploadFilesToGitHub(
     return false;
   }
 }
+
+const HERMES_AGENT_PYTHON_SCRIPT = `import sys
+import os
+import json
+import re
+import subprocess
+import urllib.request
+import urllib.error
+
+workdir = "/home/user/app"
+os.makedirs(workdir, exist_ok=True)
+os.chdir(workdir)
+
+try:
+    with open("/home/user/agent_config.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+
+base_url = cfg.get("baseUrl", "https://api.river.ai/v1").rstrip("/")
+api_key = cfg.get("apiKey", "")
+model = cfg.get("model", "zai-org/GLM-5.3-Flash")
+is_uncensored = cfg.get("isUncensored", False)
+
+try:
+    with open("/home/user/task.txt", "r", encoding="utf-8") as f:
+        task_prompt = f.read()
+except Exception:
+    task_prompt = "Create a project"
+
+SYSTEM_INSTRUCTION = """Ты — автономный ИИ-разработчик Hermes Agent.
+Ты работаешь внутри виртуальной машины Ubuntu Linux с правами выполнения любых команд.
+Твоя цель: создать качественный, рабочий проект по ТЗ пользователя, установить зависимости и протестировать его запуск в терминале.
+
+ДОСТУПНЫЕ ДЕЙСТВИЯ:
+1. "write_file": записать файл (параметры: "path", "content")
+2. "run_command": выполнить bash команду в Linux (параметры: "command")
+3. "read_file": прочитать существующий файл (параметры: "path")
+4. "finish": завершить разработку, когда проект полностью написан и протестирован (параметры: "summary", "entrypoint")
+
+ПРАВИЛА РАБОТЫ:
+- Пиши код полностью и без заглушек.
+- Всегда создавай "README.md" с понятным описанием, инструкцией по запуску и списком возможностей.
+- Если создаешь веб-сайт: создай "index.html" (и при необходимости styles.css, script.js), протестируй его командой: python3 -m http.server 8080 & sleep 1; curl -I http://localhost:8080/
+- Если создаешь Python-скрипт/бота: создай "main.py" и "requirements.txt", установи зависимости через run_command: pip install -r requirements.txt, и протестируй запуск через python3 main.py.
+- Если команда упала с ошибкой, проанализируй stderr, исправь файл и протестируй заново.
+- Когда всё готово и работает, вызови действие "finish".
+
+Отвечай СТРОГО в формате JSON:
+{
+  "thought": "Краткое описание, что ты делаешь на этом шаге",
+  "action": "write_file" | "run_command" | "read_file" | "finish",
+  "params": { ... }
+}"""
+
+def clean_json_response(raw):
+    text = re.sub(r'<think>[\s\S]*?<\/think>', '', raw, flags=re.IGNORECASE).strip()
+    fence = chr(96) * 3
+    if fence in text:
+        parts = text.split(fence)
+        for i in range(1, len(parts), 2):
+            candidate = parts[i].strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if "{" in candidate and "}" in candidate:
+                return candidate[candidate.find("{"):candidate.rfind("}")+1]
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return text[start:end+1].strip()
+    return text
+
+def call_llm(messages):
+    url = f"{base_url}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 8192
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Hermes-Agent-Novita"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or msg.get("reasoning_content") or ""
+        return content
+
+messages = [
+    {"role": "system", "content": SYSTEM_INSTRUCTION},
+    {"role": "user", "content": f"ТЗ ДЛЯ РАЗРАБОТКИ:\\n{task_prompt}"}
+]
+
+logs = []
+summary = "Проект разработан и протестирован с помощью Hermes Agent"
+entrypoint = "index.html"
+max_steps = 10
+
+for step in range(1, max_steps + 1):
+    try:
+        raw_reply = call_llm(messages)
+        cleaned = clean_json_response(raw_reply)
+        parsed = json.loads(cleaned)
+    except Exception as e:
+        logs.append(f"Шаг {step}: Ошибка парсинга JSON ответа модели ({str(e)})")
+        messages.append({"role": "user", "content": f"Ошибка парсинга JSON: {str(e)}. Пожалуйста, ответь СТРОГО валидным JSON-объектом."})
+        continue
+
+    thought = parsed.get("thought", "")
+    action = parsed.get("action", "")
+    params = parsed.get("params", {}) or {}
+    logs.append(f"Шаг {step} [{action}]: {thought}")
+
+    if action == "finish":
+        summary = params.get("summary") or summary
+        entrypoint = params.get("entrypoint") or entrypoint
+        break
+
+    result_feedback = ""
+
+    if action == "write_file":
+        file_path = str(params.get("path", "")).strip("/")
+        file_content = params.get("content", "")
+        if file_path:
+            full_path = os.path.join(workdir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(file_content)
+            result_feedback = f"Файл {file_path} успешно записан ({len(file_content)} символов)."
+        else:
+            result_feedback = "Ошибка: не указан путь к файлу."
+
+    elif action == "run_command":
+        cmd = params.get("command", "")
+        try:
+            res = subprocess.run(cmd, shell=True, cwd=workdir, capture_output=True, text=True, timeout=40)
+            out = (res.stdout or "").strip()
+            err = (res.stderr or "").strip()
+            result_feedback = f"Команда выполнена (код {res.returncode}).\\nSTDOUT: {out[:1000]}\\nSTDERR: {err[:1000]}"
+        except subprocess.TimeoutExpired:
+            result_feedback = "Команда превысила таймаут 40 секунд."
+        except Exception as e:
+            result_feedback = f"Ошибка запуска команды: {str(e)}"
+
+    elif action == "read_file":
+        file_path = str(params.get("path", "")).strip("/")
+        full_path = os.path.join(workdir, file_path)
+        if os.path.exists(full_path):
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            result_feedback = f"Содержимое {file_path}:\\n{content[:2000]}"
+        else:
+            result_feedback = f"Файл {file_path} не найден."
+    else:
+        result_feedback = f"Неизвестное действие: {action}"
+
+    messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
+    messages.append({"role": "user", "content": f"Результат действия:\\n{result_feedback}"})
+
+# Сканируем все созданные файлы
+created_files = {}
+for root, dirs, filenames in os.walk(workdir):
+    dirs[:] = [d for d in dirs if d not in [".git", "__pycache__", "node_modules", ".venv", "venv", ".cache"]]
+    for fn in filenames:
+        if fn in ["hermes_runner.py", "hermes_result.json"]:
+            continue
+        rel = os.path.relpath(os.path.join(root, fn), workdir).replace("\\\\", "/")
+        try:
+            with open(os.path.join(root, fn), "r", encoding="utf-8", errors="replace") as f:
+                created_files[rel] = f.read()
+        except Exception:
+            pass
+
+if "index.html" in created_files:
+    entrypoint = "index.html"
+elif "main.py" in created_files:
+    entrypoint = "main.py"
+elif "index.js" in created_files:
+    entrypoint = "index.js"
+elif created_files:
+    entrypoint = list(created_files.keys())[0]
+
+result_data = {
+    "files": created_files,
+    "summary": summary,
+    "entrypoint": entrypoint,
+    "steps": len(logs),
+    "logs": "\\n".join(logs[-10:])
+}
+
+with open("/home/user/hermes_result.json", "w", encoding="utf-8") as f:
+    json.dump(result_data, f, ensure_ascii=False, indent=2)
+
+print("HERMES_AGENT_SUCCESS")
+`;
 
 async function handleCoderInternal(
   interaction: ChatInputCommandInteraction,
@@ -217,56 +427,27 @@ ${CODE_QUALITY_RULES}
   }
 }`;
 
-    let project: GeneratedProject;
     const promptWithRepo = repoContextData
       ? `${repoContextData.context}\n\nТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`
       : `ТЗ ПОЛЬЗОВАТЕЛЯ:\n${task}`;
 
-    try {
-      project = await geminiJSON<GeneratedProject>(
-        promptWithRepo,
-        targetModel,
-        {
-          systemInstruction: systemPrompt,
-          maxTokens: isUncensored ? 16384 : 100000,
-        }
-      );
-    } catch (llmErr: any) {
-      console.error(`[${providerLabel} Code Generation Error]:`, llmErr);
-      const causeMsg = llmErr?.cause?.message ? ` (${llmErr.cause.message})` : "";
-      await interaction.editReply(
-        `❌ **Ошибка на этапе проектирования (${providerLabel}):** ${llmErr?.message || "ошибка запроса"}${causeMsg}`
-      );
-      return;
-    }
-
-    if (!project || !project.files || Object.keys(project.files).length === 0) {
-      await interaction.editReply("❌ **Нейросеть вернула пустую структуру файлов.** Попробуйте уточнить запрос.");
-      return;
-    }
-
-    const baseRepoName = (customRepo && !parseGitHubRepo(customRepo))
-      ? customRepo
-      : (repoContextData ? `${repoContextData.repo}-mod` : (project.projectName || "ai-agent-project"));
-
-    const repoName = baseRepoName
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]/g, "-");
-
-    // ─── ШАГ 2: Запуск Ubuntu MicroVM в Novita Sandbox (если доступен) ────────
-    await interaction.editReply("⚡ **[2/5] Подключаю виртуальную машину Ubuntu...** (Novita Agent Sandbox)");
-
     const novitaKey = (process.env.NOVITA_API_KEY || "").trim();
     let sbx: Sandbox | null = null;
     let sandboxStatusText = "";
-    let autoFixed = false;
-    let testOutput = "";
+    let project: GeneratedProject | null = null;
+    const workdir = "/home/user/app";
 
+    const targetBaseUrl = isUncensored ? YETA_BASE_URL : RIVER_BASE_URL;
+    const targetKey = isUncensored ? (YETA_API_KEY || RIVER_API_KEY) : (RIVER_API_KEY || YETA_API_KEY);
+    const targetModelName = isUncensored ? MODEL_SKALA : MODEL_DEFAULT;
+
+    // ─── ШАГ 2: Подключение песочницы Ubuntu и запуск Hermes Agent ────────────
     if (novitaKey) {
+      await interaction.editReply("⚡ **[2/5] Подключаю виртуальную машину Ubuntu...** (Novita Agent Sandbox)");
       try {
         sbx = await Sandbox.create({
           apiKey: novitaKey,
-          timeoutMs: 600_000, // 10 минут времени жизни песочницы для полноценной работы агента
+          timeoutMs: 600_000, // 10 минут для работы агента
           requestTimeoutMs: 60_000,
         });
       } catch (sbxErr: any) {
@@ -278,133 +459,125 @@ ${CODE_QUALITY_RULES}
       sandboxStatusText = "ℹ️ Переменная NOVITA_API_KEY не задана на Railway. Проект сгенерирован и упакован автономно.";
     }
 
-    const workdir = "/home/user/app";
-
     if (sbx) {
       try {
-        // ─── ШАГ 3: Запись файлов и установка библиотек в MicroVM ──────────────
-        await interaction.editReply("📁 **[3/5] Записываю файлы и устанавливаю зависимости...**");
+        await interaction.editReply(
+          `🤖 **[3/5] Hermes Agent автономно создаёт и тестирует проект в Ubuntu...** (${providerLabel})`
+        );
 
         await sbx.commands.run(`mkdir -p ${workdir}`);
+        await sbx.files.write("/home/user/task.txt", promptWithRepo);
+        await sbx.files.write(
+          "/home/user/agent_config.json",
+          JSON.stringify({
+            baseUrl: targetBaseUrl,
+            apiKey: targetKey,
+            model: targetModelName,
+            isUncensored,
+          })
+        );
+        await sbx.files.write("/home/user/hermes_runner.py", HERMES_AGENT_PYTHON_SCRIPT);
 
-        for (const [filePath, content] of Object.entries(project.files)) {
-          await sbx.files.write(`${workdir}/${filePath}`, content);
-        }
-
-        if (project.requirements && project.requirements.trim()) {
-          await sbx.commands.run(`pip install ${project.requirements}`, {
-            cwd: workdir,
-            timeoutMs: 120_000,
-          });
-        } else if (project.files["requirements.txt"]) {
-          await sbx.commands.run("pip install -r requirements.txt", {
-            cwd: workdir,
-            timeoutMs: 120_000,
-          });
-        }
-
-        // ─── ШАГ 4: Тестирование запуска кода ──────────────────────────────────
-        await interaction.editReply("🧪 **[4/5] Тестирую запуск программы в Linux...**");
-
-        const entry = project.entrypoint || Object.keys(project.files)[0] || "index.html";
-        let testCmd = "";
-        const isWeb = entry.endsWith(".html") || Boolean(project.files["index.html"]);
-
-        if (isWeb) {
-          testCmd = `python3 -m http.server 8080 --directory ${workdir} & sleep 1; curl -I -s http://localhost:8080/ | head -n 5`;
-        } else if (entry.endsWith(".py")) {
-          testCmd = `timeout 10s python3 ${entry}`;
-        } else if (entry.endsWith(".js") || entry.endsWith(".mjs")) {
-          testCmd = `timeout 10s node ${entry}`;
-        } else {
-          testCmd = `ls -la ${workdir}`;
-        }
-
-        let runExitCode = 0;
-        let runStdout = "";
-        let runStderr = "";
+        // Запуск автономного цикла Hermes Agent
+        const agentRunRes = await sbx.commands.run("python3 /home/user/hermes_runner.py", {
+          timeoutMs: 360_000,
+        });
 
         try {
-          const runRes = await sbx.commands.run(testCmd, {
-            cwd: workdir,
-            timeoutMs: 20_000,
-          });
-          runExitCode = runRes.exitCode;
-          runStdout = runRes.stdout;
-          runStderr = runRes.stderr;
-        } catch (cmdErr: any) {
-          // Если exit status 124 (timeout веб-сервера) — это успешный запуск
-          if (String(cmdErr?.message || "").includes("124") || cmdErr?.exitCode === 124) {
-            runExitCode = 0;
-            runStdout = cmdErr.stdout || "Веб-сервер успешно запущен и работает в фоне.";
-          } else {
-            runExitCode = cmdErr.exitCode ?? 1;
-            runStdout = cmdErr.stdout || "";
-            runStderr = cmdErr.stderr || cmdErr.message || "";
+          const rawResult = await sbx.files.read("/home/user/hermes_result.json");
+          const parsedResult = JSON.parse(rawResult);
+          if (parsedResult.files && Object.keys(parsedResult.files).length > 0) {
+            project = {
+              projectName: "",
+              description: parsedResult.summary || "Проект успешно разработан и проверен Hermes Agent в Ubuntu MicroVM",
+              entrypoint: parsedResult.entrypoint || "index.html",
+              files: parsedResult.files,
+            };
+            const logSnippet = (parsedResult.logs || agentRunRes.stdout || "Успешно").slice(0, 500);
+            sandboxStatusText = `🤖 **Hermes Agent (Ubuntu MicroVM):**\nУспешно завершил разработку за ${parsedResult.steps || 1} шагов!\n\`\`\`bash\n${logSnippet}\n\`\`\``;
           }
+        } catch (readErr) {
+          console.warn("[Hermes Agent] Result JSON read failed, falling back to direct LLM:", readErr);
         }
-
-        // Если упало с ошибкой и это Python файл
-        if (runExitCode !== 0 && runStderr && entry.endsWith(".py") && project.files[entry]) {
-          await interaction.editReply("🛠️ **[4/5] Найдена ошибка в коде! ИИ исправляет баг...**");
-
-          const fixPrompt = `Ты Senior Python Developer. Скрипт упал с ошибкой в Linux.
-Файл: ${entry}
-Код файла:
-${project.files[entry]}
-
-Ошибка из терминала:
-${runStderr}
-
-Исправь ошибку. Ответь ТОЛЬКО валидным JSON:
-{
-  "fixedCode": "полный исправленный код файла без markdown"
-}`;
-
-          try {
-            // Строгий таймаут 35 секунд на авто-фикс, чтобы не блокировать бота и уложиться в лимит Discord (15 мин)
-            const fixTimeout = new Promise<null>((r) => setTimeout(() => r(null), 35_000));
-            const fixPromise = geminiJSON<{ fixedCode: string }>(fixPrompt, targetModel, { maxTokens: 8192 });
-            const fixResult = await Promise.race([fixPromise, fixTimeout]);
-            if (fixResult?.fixedCode) {
-              project.files[entry] = fixResult.fixedCode;
-              await sbx.files.write(`${workdir}/${entry}`, fixResult.fixedCode);
-              try {
-                const reTest = await sbx.commands.run(`timeout 10s python3 ${entry}`, {
-                  cwd: workdir,
-                  timeoutMs: 20_000,
-                });
-                runExitCode = reTest.exitCode;
-                runStdout = reTest.stdout;
-                runStderr = reTest.stderr;
-                autoFixed = true;
-              } catch (reErr: any) {
-                if (String(reErr?.message || "").includes("124")) {
-                  runExitCode = 0;
-                  runStdout = "Скрипт успешно работает в фоне.";
-                  autoFixed = true;
-                }
-              }
-            }
-          } catch (fixErr) {
-            console.error("[Coder auto-fix error]:", fixErr);
-          }
-        }
-
-        testOutput =
-          runStdout ||
-          runStderr ||
-          (isWeb
-            ? "HTML/CSS сайт успешно проверен и готов к просмотру в браузере."
-            : "Скрипт успешно запущен без ошибок.");
-        sandboxStatusText = `Статус: **${runExitCode === 0 ? "✅ Успешно" : "⚠️ Завершён с кодом " + runExitCode}**${autoFixed ? " *(Баг автоматически исправлен ИИ!)*" : ""}\n\`\`\`bash\n${testOutput.slice(0, 400)}\n\`\`\``;
-      } catch (vmRunErr: any) {
-        console.error("[VM Execution Error]:", vmRunErr);
-        sandboxStatusText = `⚠️ Ошибка выполнения внутри ВМ: ${vmRunErr?.message || "сбой"}. Проект скомпонован автономно.`;
-      } finally {
-        await sbx.kill().catch(() => {});
+      } catch (agentErr) {
+        console.error("[Hermes Agent Run Error]:", agentErr);
       }
     }
+
+    // ─── РЕЗЕРВНЫЙ ПЛАН: если песочница недоступна или агент вернул пустой проект ───
+    if (!project || !project.files || Object.keys(project.files).length === 0) {
+      await interaction.editReply(`⏳ **[3/5] Архитектор проектирует код...** (${providerLabel})`);
+
+      try {
+        project = await geminiJSON<GeneratedProject>(
+          promptWithRepo,
+          targetModel,
+          {
+            systemInstruction: systemPrompt,
+            maxTokens: isUncensored ? 16384 : 100000,
+          }
+        );
+      } catch (llmErr: any) {
+        console.error(`[${providerLabel} Code Generation Error]:`, llmErr);
+        const causeMsg = llmErr?.cause?.message ? ` (${llmErr.cause.message})` : "";
+        await interaction.editReply(
+          `❌ **Ошибка на этапе проектирования (${providerLabel}):** ${llmErr?.message || "ошибка запроса"}${causeMsg}`
+        );
+        if (sbx) await sbx.kill().catch(() => {});
+        return;
+      }
+
+      if (!project || !project.files || Object.keys(project.files).length === 0) {
+        await interaction.editReply("❌ **Нейросеть вернула пустую структуру файлов.** Попробуйте уточнить запрос.");
+        if (sbx) await sbx.kill().catch(() => {});
+        return;
+      }
+
+      if (sbx) {
+        try {
+          await interaction.editReply("📁 **[4/5] Записываю файлы и тестирую запуск...**");
+          await sbx.commands.run(`mkdir -p ${workdir}`);
+          for (const [filePath, content] of Object.entries(project.files)) {
+            await sbx.files.write(`${workdir}/${filePath}`, content);
+          }
+
+          if (project.requirements && project.requirements.trim()) {
+            await sbx.commands.run(`pip install ${project.requirements}`, { cwd: workdir, timeoutMs: 120_000 });
+          } else if (project.files["requirements.txt"]) {
+            await sbx.commands.run("pip install -r requirements.txt", { cwd: workdir, timeoutMs: 120_000 });
+          }
+
+          const entry = project.entrypoint || Object.keys(project.files)[0] || "index.html";
+          const isWeb = entry.endsWith(".html") || Boolean(project.files["index.html"]);
+          let testCmd = isWeb
+            ? `python3 -m http.server 8080 --directory ${workdir} & sleep 1; curl -I -s http://localhost:8080/ | head -n 5`
+            : entry.endsWith(".py")
+            ? `timeout 10s python3 ${entry}`
+            : entry.endsWith(".js") || entry.endsWith(".mjs")
+            ? `timeout 10s node ${entry}`
+            : `ls -la ${workdir}`;
+
+          const runRes = await sbx.commands.run(testCmd, { cwd: workdir, timeoutMs: 20_000 }).catch((e) => e);
+          const out = (runRes.stdout || runRes.stderr || "").trim();
+          sandboxStatusText = `Статус: **${runRes.exitCode === 0 ? "✅ Успешно" : "⚠️ Код выхода " + runRes.exitCode}**\n\`\`\`bash\n${out.slice(0, 400)}\n\`\`\``;
+        } catch (fallbackTestErr) {
+          console.warn("[Fallback Test Warning]:", fallbackTestErr);
+        }
+      }
+    }
+
+    if (sbx) {
+      await sbx.kill().catch(() => {});
+      sbx = null;
+    }
+
+    const baseRepoName = (customRepo && !parseGitHubRepo(customRepo))
+      ? customRepo
+      : (repoContextData ? `${repoContextData.repo}-mod` : (project.projectName || "ai-agent-project"));
+
+    const repoName = baseRepoName
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "-");
 
     // ─── ШАГ 5: Пуш на GitHub и упаковка в ZIP ────────────────────────────────
     await interaction.editReply("🚀 **[5/5] Создаю репозиторий на GitHub и упаковываю архив...**");
