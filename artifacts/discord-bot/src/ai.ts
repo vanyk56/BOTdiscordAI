@@ -190,19 +190,42 @@ export async function openrouterRequest(
 
   let lastFetchError: any = null;
 
-  // Retry up to 3 times for network resilience (включая чтение стрима)
+  let currentBaseUrl = targetBaseUrl;
+  let currentApiKey = targetApiKey;
+  let currentModel = model;
+
+  // Retry up to 3 times with automatic cross-provider fallback (River AI <-> Yeta AI)
   for (let attempt = 1; attempt <= 3; attempt++) {
+    // Если на предыдущей попытке произошел таймаут или сбой — переключаемся на резервный провайдер
+    if (attempt >= 2) {
+      if (currentBaseUrl === RIVER_BASE_URL && YETA_API_KEY) {
+        console.warn(`[AI] River AI failed/aborted. Switching to fallback Yeta AI (DeepSeek) on attempt ${attempt}...`);
+        currentBaseUrl = YETA_BASE_URL;
+        currentApiKey = YETA_API_KEY;
+        currentModel = MODEL_SKALA;
+        payload.model = MODEL_SKALA;
+        payload.max_tokens = Math.min(Number(payload.max_tokens) || 8192, 8192);
+      } else if (currentBaseUrl === YETA_BASE_URL && RIVER_API_KEY) {
+        console.warn(`[AI] Yeta AI failed/aborted. Switching to fallback River AI (GLM-5.3-Flash) on attempt ${attempt}...`);
+        currentBaseUrl = RIVER_BASE_URL;
+        currentApiKey = RIVER_API_KEY;
+        currentModel = MODEL_DEFAULT;
+        payload.model = MODEL_DEFAULT;
+        payload.max_tokens = Math.min(Number(payload.max_tokens) || 8192, 8192);
+      }
+    }
+
     try {
       const controller = new AbortController();
-      // Максимум 150 секунд на попытку (включая чтение стрима)
-      const timeout = setTimeout(() => controller.abort(), 150_000);
+      // Максимум 45 секунд на попытку (вместо 150с), чтобы не морозить Discord
+      const timeout = setTimeout(() => controller.abort(), 45_000);
       let response: Response;
 
       try {
-        response = await fetch(`${targetBaseUrl}/chat/completions`, {
+        response = await fetch(`${currentBaseUrl}/chat/completions`, {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${targetApiKey}`,
+            "Authorization": `Bearer ${currentApiKey}`,
             "Content-Type": "application/json",
             "HTTP-Referer": "https://discord.com",
             "X-Title": "SWAGAgpt Discord Bot",

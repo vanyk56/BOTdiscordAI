@@ -182,6 +182,9 @@ except Exception:
 base_url = cfg.get("baseUrl", "https://api.river.ai/v1").rstrip("/")
 api_key = cfg.get("apiKey", "")
 model = cfg.get("model", "zai-org/GLM-5.3-Flash")
+backup_base_url = cfg.get("backupBaseUrl", "").rstrip("/")
+backup_api_key = cfg.get("backupApiKey", "")
+backup_model = cfg.get("backupModel", "deepseek-v4.1-flash-uncensored")
 is_uncensored = cfg.get("isUncensored", False)
 
 try:
@@ -232,10 +235,10 @@ def clean_json_response(raw):
         return text[start:end+1].strip()
     return text
 
-def call_llm(messages):
-    url = f"{base_url}/chat/completions"
+def call_single_endpoint(u_base, u_key, u_mod, messages):
+    url = f"{u_base}/chat/completions"
     payload = {
-        "model": model,
+        "model": u_mod,
         "messages": messages,
         "temperature": 0.2,
         "max_tokens": 8192,
@@ -245,12 +248,12 @@ def call_llm(messages):
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {u_key}",
             "Content-Type": "application/json",
             "User-Agent": "Hermes-Agent-Novita"
         }
     )
-    with urllib.request.urlopen(req, timeout=40) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         content_type = resp.headers.get("Content-Type", "")
         if "text/event-stream" in content_type:
             content = ""
@@ -270,6 +273,26 @@ def call_llm(messages):
             data = json.loads(resp.read().decode("utf-8"))
             msg = data["choices"][0]["message"]
             return msg.get("content") or msg.get("reasoning_content") or ""
+
+def call_llm(messages):
+    endpoints = [(base_url, api_key, model)]
+    if backup_base_url and backup_api_key and backup_base_url != base_url:
+        endpoints.append((backup_base_url, backup_api_key, backup_model))
+
+    last_err = None
+    for b_url, b_key, b_mod in endpoints:
+        if not b_url or not b_key:
+            continue
+        try:
+            res = call_single_endpoint(b_url, b_key, b_mod, messages)
+            if res and res.strip():
+                return res
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    raise Exception("Все LLM эндпоинты недоступны")
 
 messages = [
     {"role": "system", "content": SYSTEM_INSTRUCTION},
@@ -517,6 +540,10 @@ ${CODE_QUALITY_RULES}
     const targetKey = isUncensored ? (YETA_API_KEY || RIVER_API_KEY) : (RIVER_API_KEY || YETA_API_KEY);
     const targetModelName = isUncensored ? MODEL_SKALA : MODEL_DEFAULT;
 
+    const backupBaseUrl = isUncensored ? RIVER_BASE_URL : YETA_BASE_URL;
+    const backupKey = isUncensored ? (RIVER_API_KEY || YETA_API_KEY) : (YETA_API_KEY || RIVER_API_KEY);
+    const backupModelName = isUncensored ? MODEL_DEFAULT : MODEL_SKALA;
+
     // ─── ШАГ 2: Подключение песочницы Ubuntu и запуск Hermes Agent ────────────
     if (novitaKey) {
       await interaction.editReply("⚡ **[2/5] Подключаю виртуальную машину Ubuntu...** (Novita Agent Sandbox)");
@@ -549,6 +576,9 @@ ${CODE_QUALITY_RULES}
             baseUrl: targetBaseUrl,
             apiKey: targetKey,
             model: targetModelName,
+            backupBaseUrl,
+            backupApiKey: backupKey,
+            backupModel: backupModelName,
             isUncensored,
           })
         );
