@@ -257,9 +257,29 @@ export async function openrouterRequest(
 
         const status = response.status;
         const provider = isSkala ? "Yeta AI" : "River AI";
+
+        // Авто-повтор при серверных сбоях 5xx или ошибках вышестоящего провайдера (upstream error)
+        const isUpstreamError =
+          (status >= 500 && status <= 504) ||
+          errBody.includes("upstream error") ||
+          errBody.includes("do_request_failed");
+
+        if (isUpstreamError && attempt < 3) {
+          console.warn(`[AI] ${provider} 5xx/upstream error on attempt ${attempt}/3 (${status}). Retrying in ${2 * attempt}s...`);
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
+          continue;
+        }
+
         if (status === 524) {
           throw new Error(`${provider} таймаут (Cloudflare 524: сервер Yeta AI не ответил вовремя). Попробуйте повторить запрос.`);
         }
+
+        if (isUpstreamError) {
+          throw new Error(
+            `Сервер ${provider} временно перегружен или перезагружает модель (upstream error: сбой воркера). Попробуйте повторить через 1-2 минуты или временно переключитесь на /mode стандартный.`
+          );
+        }
+
         const cleanError = errBody.startsWith("<!DOCTYPE") ? "Сервер вернул HTML страницу ошибки (возможно, перегружен)" : errBody;
         throw new Error(`${provider} API error (${status}): ${cleanError.slice(0, 300)}`);
       }
