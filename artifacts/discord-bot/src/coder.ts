@@ -30,11 +30,12 @@ interface GeneratedProject {
 }
 
 async function createGitHubRepo(token: string, repoName: string, description: string): Promise<boolean> {
+  const auth = token.startsWith("ghp_") ? `token ${token}` : `Bearer ${token}`;
   try {
     const res = await fetch("https://api.github.com/user/repos", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${token}`,
+        "Authorization": auth,
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "SWAGAgpt-Discord-Bot",
         "Content-Type": "application/json",
@@ -53,24 +54,49 @@ async function createGitHubRepo(token: string, repoName: string, description: st
   }
 }
 
+async function waitForRepoBranch(token: string, owner: string, repo: string, maxWaitMs = 8_000): Promise<boolean> {
+  const auth = token.startsWith("ghp_") ? `token ${token}` : `Bearer ${token}`;
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/branches/main`, {
+        headers: {
+          "Authorization": auth,
+          "User-Agent": "SWAGAgpt-Discord-Bot",
+          "Accept": "application/vnd.github.v3+json",
+        },
+      });
+      if (res.ok) return true;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  return false;
+}
+
 async function uploadFilesToGitHub(
   token: string,
   owner: string,
   repo: string,
   files: Record<string, string>
-): Promise<boolean> {
+): Promise<{ uploadedCount: number; error?: string }> {
   let uploadedCount = 0;
   const entries = Object.entries(files);
+  const auth = token.startsWith("ghp_") ? `token ${token}` : `Bearer ${token}`;
+  let lastError = "";
+
   try {
     for (const [filePath, content] of entries) {
       const cleanPath = filePath.replace(/^\/+/, "");
       const url = `https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`;
       let sha: string | undefined;
+
+      // Получаем sha, если файл уже существует (например, README.md от auto_init)
       try {
         const getRes = await fetch(url, {
           headers: {
-            "Authorization": `Bearer ${token}`,
+            "Authorization": auth,
             "User-Agent": "SWAGAgpt-Discord-Bot",
+            "Accept": "application/vnd.github.v3+json",
           },
         });
         if (getRes.ok) {
@@ -79,24 +105,47 @@ async function uploadFilesToGitHub(
         }
       } catch {}
 
-      const putRes = await fetch(url, {
-        method: "PUT",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Accept": "application/vnd.github.v3+json",
-          "User-Agent": "SWAGAgpt-Discord-Bot",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          message: `Add ${cleanPath} via AI Agent`,
-          content: Buffer.from(content, "utf-8").toString("base64"),
-          branch: "main",
-          ...(sha ? { sha } : {}),
-        }),
-      });
+      const strContent = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+      const b64 = Buffer.from(strContent, "utf-8").toString("base64");
+
+      const doPut = async (fileSha?: string) => {
+        return await fetch(url, {
+          method: "PUT",
+          headers: {
+            "Authorization": auth,
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "SWAGAgpt-Discord-Bot",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message: `Add ${cleanPath} via AI Agent`,
+            content: b64,
+            branch: "main",
+            ...(fileSha ? { sha: fileSha } : {}),
+          }),
+        });
+      };
+
+      let putRes = await doPut(sha);
+
+      // Если 409 Conflict (гонка с auto_init или sha устарел) — повторная попытка
+      if (putRes.status === 409) {
+        await new Promise((r) => setTimeout(r, 1200));
+        try {
+          const retryGet = await fetch(url, {
+            headers: { "Authorization": auth, "User-Agent": "SWAGAgpt-Discord-Bot" },
+          });
+          if (retryGet.ok) {
+            const info = (await retryGet.json()) as any;
+            sha = info.sha;
+          }
+        } catch {}
+        putRes = await doPut(sha);
+      }
 
       if (!putRes.ok) {
         const errText = await putRes.text();
+        lastError = `HTTP ${putRes.status}: ${errText.slice(0, 200)}`;
         console.error(
           `[GitHub API] Failed to upload ${cleanPath} (status ${putRes.status}): ${errText.slice(0, 300)}`
         );
@@ -105,10 +154,10 @@ async function uploadFilesToGitHub(
       }
     }
     console.log(`[GitHub API] Uploaded ${uploadedCount}/${entries.length} files to ${owner}/${repo}`);
-    return uploadedCount > 0;
-  } catch (err) {
+    return { uploadedCount, error: uploadedCount === 0 ? lastError : undefined };
+  } catch (err: any) {
     console.error("[GitHub API] uploadFiles error:", err);
-    return false;
+    return { uploadedCount, error: err?.message || String(err) };
   }
 }
 
@@ -200,7 +249,7 @@ def call_llm(messages):
             "User-Agent": "Hermes-Agent-Novita"
         }
     )
-    with urllib.request.urlopen(req, timeout=90) as resp:
+    with urllib.request.urlopen(req, timeout=35) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         msg = data["choices"][0]["message"]
         content = msg.get("content") or msg.get("reasoning_content") or ""
@@ -214,15 +263,25 @@ messages = [
 logs = []
 summary = "Проект разработан и протестирован с помощью Hermes Agent"
 entrypoint = "index.html"
-max_steps = 10
+max_steps = 8
 
 for step in range(1, max_steps + 1):
     try:
         raw_reply = call_llm(messages)
+    except urllib.error.HTTPError as e:
+        logs.append(f"HTTP ошибка LLM ({e.code}): {e.reason}")
+        break
+    except Exception as e:
+        logs.append(f"Сетевой сбой LLM: {str(e)}")
+        break
+
+    try:
         cleaned = clean_json_response(raw_reply)
         parsed = json.loads(cleaned)
     except Exception as e:
-        logs.append(f"Шаг {step}: Ошибка парсинга JSON ответа модели ({str(e)})")
+        logs.append(f"Шаг {step}: Ошибка парсинга JSON ({str(e)})")
+        if step >= 2:
+            break
         messages.append({"role": "user", "content": f"Ошибка парсинга JSON: {str(e)}. Пожалуйста, ответь СТРОГО валидным JSON-объектом."})
         continue
 
@@ -435,6 +494,7 @@ ${CODE_QUALITY_RULES}
     let sbx: Sandbox | null = null;
     let sandboxStatusText = "";
     let project: GeneratedProject | null = null;
+    let isHermesUsed = false;
     const workdir = "/home/user/app";
 
     const targetBaseUrl = isUncensored ? YETA_BASE_URL : RIVER_BASE_URL;
@@ -478,9 +538,9 @@ ${CODE_QUALITY_RULES}
         );
         await sbx.files.write("/home/user/hermes_runner.py", HERMES_AGENT_PYTHON_SCRIPT);
 
-        // Запуск автономного цикла Hermes Agent
+        // Запуск автономного цикла Hermes Agent с быстрым таймаутом (до 80с)
         const agentRunRes = await sbx.commands.run("python3 /home/user/hermes_runner.py", {
-          timeoutMs: 360_000,
+          timeoutMs: 80_000,
         });
 
         try {
@@ -493,6 +553,7 @@ ${CODE_QUALITY_RULES}
               entrypoint: parsedResult.entrypoint || "index.html",
               files: parsedResult.files,
             };
+            isHermesUsed = true;
             const logSnippet = (parsedResult.logs || agentRunRes.stdout || "Успешно").slice(0, 500);
             sandboxStatusText = `🤖 **Hermes Agent (Ubuntu MicroVM):**\nУспешно завершил разработку за ${parsedResult.steps || 1} шагов!\n\`\`\`bash\n${logSnippet}\n\`\`\``;
           }
@@ -585,16 +646,21 @@ ${CODE_QUALITY_RULES}
     const ghUser = (process.env.GITHUB_USER || "").trim();
     const ghToken = (process.env.GITHUB_TOKEN || "").trim();
     let repoUrl: string | null = null;
+    let githubStatusMessage: string | null = null;
 
     if (ghUser && ghToken) {
       try {
         const created = await createGitHubRepo(ghToken, repoName, project.description);
         if (created) {
-          // Даем GitHub 2 секунды на инициализацию ветки main из auto_init
-          await new Promise((r) => setTimeout(r, 2000));
-          const uploaded = await uploadFilesToGitHub(ghToken, ghUser, repoName, project.files);
-          if (uploaded) {
+          // Ждём инициализации ветки main (до 8 секунд)
+          await waitForRepoBranch(ghToken, ghUser, repoName, 8000);
+          const uploadResult = await uploadFilesToGitHub(ghToken, ghUser, repoName, project.files);
+          if (uploadResult.uploadedCount > 0) {
             repoUrl = `https://github.com/${ghUser}/${repoName}`;
+            githubStatusMessage = `[${ghUser}/${repoName}](${repoUrl}) — загружено ${uploadResult.uploadedCount} файлов! 🚀`;
+          } else {
+            const errDetail = uploadResult.error ? ` (${uploadResult.error})` : "";
+            githubStatusMessage = `⚠️ Репозиторий [${ghUser}/${repoName}](https://github.com/${ghUser}/${repoName}) создан, но файлы не загрузились${errDetail}.\n👉 **Проверьте токен на GitHub**: для Fine-grained выберите \`All repositories\` и \`Contents: Read and write\`, либо создайте Classic токен с галочкой \`repo\`!`;
           }
         }
       } catch (ghErr) {
@@ -622,12 +688,19 @@ ${CODE_QUALITY_RULES}
       .addFields(
         { name: "📁 Созданные файлы", value: fileNames.slice(0, 1000), inline: true },
         {
+          name: "⚙️ Движок разработки",
+          value: isHermesUsed
+            ? "🤖 **Hermes Agent** (Ubuntu MicroVM)"
+            : `⚡ **Архитектор** (${providerLabel})`,
+          inline: true,
+        },
+        {
           name: "🧪 Тест в Ubuntu MicroVM",
           value: sandboxStatusText.slice(0, 1000),
         }
       )
       .setFooter({
-        text: `Разработано ${isUncensored ? "Uncensored " : ""}AI Agent • Модель: ${isUncensored ? "DeepSeek V4.1 Uncensored (Yeta)" : "GLM-5.3-Flash (River)"} • Sandbox: Novita Linux`,
+        text: `Разработано ${isHermesUsed ? "Hermes Agent" : "AI Architect"} • Модель: ${isUncensored ? "DeepSeek V4.1 Uncensored (Yeta)" : "GLM-5.3-Flash (River)"} • Sandbox: Novita Linux`,
       })
       .setTimestamp();
 
@@ -639,7 +712,12 @@ ${CODE_QUALITY_RULES}
       });
     }
 
-    if (repoUrl) {
+    if (githubStatusMessage) {
+      embed.addFields({
+        name: "🔗 GitHub Репозиторий",
+        value: githubStatusMessage,
+      });
+    } else if (repoUrl) {
       embed.addFields({
         name: "🔗 GitHub Репозиторий",
         value: `[${ghUser}/${repoName}](${repoUrl}) — код уже запушен!`,
