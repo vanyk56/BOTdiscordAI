@@ -238,7 +238,8 @@ def call_llm(messages):
         "model": model,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 8192
+        "max_tokens": 8192,
+        "stream": True
     }
     req = urllib.request.Request(
         url,
@@ -249,11 +250,26 @@ def call_llm(messages):
             "User-Agent": "Hermes-Agent-Novita"
         }
     )
-    with urllib.request.urlopen(req, timeout=35) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        msg = data["choices"][0]["message"]
-        content = msg.get("content") or msg.get("reasoning_content") or ""
-        return content
+    with urllib.request.urlopen(req, timeout=40) as resp:
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/event-stream" in content_type:
+            content = ""
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or line == "data: [DONE]":
+                    continue
+                if line.startswith("data: "):
+                    try:
+                        chunk = json.loads(line[6:])
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content += delta.get("content") or delta.get("reasoning_content") or ""
+                    except Exception:
+                        pass
+            return content
+        else:
+            data = json.loads(resp.read().decode("utf-8"))
+            msg = data["choices"][0]["message"]
+            return msg.get("content") or msg.get("reasoning_content") or ""
 
 messages = [
     {"role": "system", "content": SYSTEM_INSTRUCTION},
@@ -575,7 +591,7 @@ ${CODE_QUALITY_RULES}
           targetModel,
           {
             systemInstruction: systemPrompt,
-            maxTokens: isUncensored ? 16384 : 100000,
+            maxTokens: 16384,
           }
         );
       } catch (llmErr: any) {
