@@ -122,11 +122,8 @@ async function readSSEStream(response: Response, abortSignal?: AbortSignal): Pro
       } catch {}
     }
   } catch (streamErr: any) {
-    // Если соединение оборвалось или заглохло по таймауту, но сервер уже передал проект
-    if (contentText.trim().length > 100 && (contentText.includes("}") || contentText.includes("```"))) {
-      console.warn(`[AI Stream] Stream ended (${streamErr?.message || streamErr}), but received ${contentText.length} chars. Using partial content.`);
-      return contentText;
-    }
+    // При прерывании или сбое стрима выбрасываем ошибку, чтобы сработал retry / fallback на другой сервис,
+    // а не отправлялся обрубленный на полуслове JSON
     throw streamErr;
   }
 
@@ -217,8 +214,8 @@ export async function openrouterRequest(
 
     try {
       const controller = new AbortController();
-      // Максимум 45 секунд на попытку (вместо 150с), чтобы не морозить Discord
-      const timeout = setTimeout(() => controller.abort(), 45_000);
+      // Максимум 120 секунд на попытку генерации кода и стрима
+      const timeout = setTimeout(() => controller.abort(), 120_000);
       let response: Response;
 
       try {

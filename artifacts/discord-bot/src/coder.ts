@@ -221,14 +221,13 @@ SYSTEM_INSTRUCTION = """Ты — автономный ИИ-разработчи�
 def clean_json_response(raw):
     text = re.sub(r'<think>[\s\S]*?<\/think>', '', raw, flags=re.IGNORECASE).strip()
     fence = chr(96) * 3
-    if fence in text:
-        parts = text.split(fence)
-        for i in range(1, len(parts), 2):
-            candidate = parts[i].strip()
-            if candidate.startswith("json"):
-                candidate = candidate[4:].strip()
-            if "{" in candidate and "}" in candidate:
-                return candidate[candidate.find("{"):candidate.rfind("}")+1]
+    if text.startswith(fence):
+        lines = text.split("\n")
+        if lines and lines[0].strip().startswith(fence):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith(fence):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1 and end > start:
@@ -304,6 +303,42 @@ summary = "Проект разработан и протестирован с п
 entrypoint = "index.html"
 max_steps = 8
 
+def save_current_result():
+    created = {}
+    for root, dirs, filenames in os.walk(workdir):
+        dirs[:] = [d for d in dirs if d not in [".git", "__pycache__", "node_modules", ".venv", "venv", ".cache"]]
+        for fn in filenames:
+            if fn in ["hermes_runner.py", "hermes_result.json"]:
+                continue
+            rel = os.path.relpath(os.path.join(root, fn), workdir).replace("\\\\", "/")
+            try:
+                with open(os.path.join(root, fn), "r", encoding="utf-8", errors="replace") as f:
+                    created[rel] = f.read()
+            except Exception:
+                pass
+    ep = "index.html"
+    if "index.html" in created:
+        ep = "index.html"
+    elif "main.py" in created:
+        ep = "main.py"
+    elif "index.js" in created:
+        ep = "index.js"
+    elif created:
+        ep = list(created.keys())[0]
+
+    data = {
+        "files": created,
+        "summary": summary,
+        "entrypoint": ep,
+        "steps": len(logs),
+        "logs": "\\n".join(logs[-10:])
+    }
+    try:
+        with open("/home/user/hermes_result.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 for step in range(1, max_steps + 1):
     try:
         raw_reply = call_llm(messages)
@@ -316,7 +351,7 @@ for step in range(1, max_steps + 1):
 
     try:
         cleaned = clean_json_response(raw_reply)
-        parsed = json.loads(cleaned)
+        parsed = json.loads(cleaned, strict=False)
     except Exception as e:
         logs.append(f"Шаг {step}: Ошибка парсинга JSON ({str(e)})")
         if step >= 2:
@@ -332,6 +367,7 @@ for step in range(1, max_steps + 1):
     if action == "finish":
         summary = params.get("summary") or summary
         entrypoint = params.get("entrypoint") or entrypoint
+        save_current_result()
         break
 
     result_feedback = ""
@@ -345,6 +381,7 @@ for step in range(1, max_steps + 1):
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(file_content)
             result_feedback = f"Файл {file_path} успешно записан ({len(file_content)} символов)."
+            save_current_result()
         else:
             result_feedback = "Ошибка: не указан путь к файлу."
 
@@ -584,9 +621,9 @@ ${CODE_QUALITY_RULES}
         );
         await sbx.files.write("/home/user/hermes_runner.py", HERMES_AGENT_PYTHON_SCRIPT);
 
-        // Запуск автономного цикла Hermes Agent с быстрым таймаутом (до 80с)
+        // Запуск автономного цикла Hermes Agent (до 180с / 3 мин)
         const agentRunRes = await sbx.commands.run("python3 /home/user/hermes_runner.py", {
-          timeoutMs: 80_000,
+          timeoutMs: 180_000,
         });
 
         try {
