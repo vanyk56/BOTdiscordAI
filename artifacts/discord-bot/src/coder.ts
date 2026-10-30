@@ -266,8 +266,8 @@ ${CODE_QUALITY_RULES}
       try {
         sbx = await Sandbox.create({
           apiKey: novitaKey,
-          timeoutMs: 180_000,
-          requestTimeoutMs: 30_000,
+          timeoutMs: 600_000, // 10 минут времени жизни песочницы для полноценной работы агента
+          requestTimeoutMs: 60_000,
         });
       } catch (sbxErr: any) {
         console.warn("[Novita Sandbox Init Warning]:", sbxErr?.message || sbxErr);
@@ -294,12 +294,12 @@ ${CODE_QUALITY_RULES}
         if (project.requirements && project.requirements.trim()) {
           await sbx.commands.run(`pip install ${project.requirements}`, {
             cwd: workdir,
-            timeoutMs: 60_000,
+            timeoutMs: 120_000,
           });
         } else if (project.files["requirements.txt"]) {
           await sbx.commands.run("pip install -r requirements.txt", {
             cwd: workdir,
-            timeoutMs: 60_000,
+            timeoutMs: 120_000,
           });
         }
 
